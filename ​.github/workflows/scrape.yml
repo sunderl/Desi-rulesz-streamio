@@ -1,9 +1,8 @@
-name: Scrape DesiSerials & Update Stremio Addon
+name: Scrape TV Serials & Update Stremio Addon
 ​on:
 schedule:
-# Runs every 1 hour automatically
-- cron: '0 * * * *'
-workflow_dispatch:
+- cron: '0 * * * *' # Executes every hour automatically
+workflow_dispatch: # Allows manual trigger anytime from GitHub UI
 ​permissions:
 contents: write
 ​jobs:
