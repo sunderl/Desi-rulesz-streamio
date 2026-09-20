@@ -22,28 +22,21 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("desiserials")
 TARGET_SITE = os.getenv("TARGET_SITE", "https://www.desiserials.ru").rstrip("/")
 TARGET_HOST = (urlparse(TARGET_SITE).hostname or "www.desiserials.ru").lower()
+ZEE_SOURCE = "https://watch.desitashan.ru"
+ZEE_CATEGORY = f"{ZEE_SOURCE}/category/zee-tv/"
+ZEE_HOST = (urlparse(ZEE_SOURCE).hostname or "").lower()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DEFAULT_POSTER = os.getenv("DEFAULT_POSTER", "https://images.unsplash.com/photo-1593784991095-a205069470b6?w=500&q=80")
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
 MAX_CATALOG_ITEMS, MAX_VIDEOS = 100, 250
 MAX_STREAMS_PER_REQUEST, STREAM_CANDIDATES_LIMIT, STREAM_CONCURRENCY = 30, 40, 8
-CHANNELS = {
-    "star_plus": ("Star Plus", "star-plus"), "colors_tv": ("Colors TV", "colors-tv"),
-    "zee_tv": ("Zee TV", "zee-tv"), "sony_tv": ("Sony TV", "sony-tv"),
-    "sab_tv": ("SAB TV", "sab-tv"), "and_tv": ("And TV", "and-tv"),
-    "dangal_tv": ("Dangal TV", "dangal-tv"),
-}
+CHANNELS = {"star_plus": ("Star Plus", "star-plus"), "colors_tv": ("Colors TV", "colors-tv"), "zee_tv": ("Zee TV", "zee-tv"), "sony_tv": ("Sony TV", "sony-tv"), "sab_tv": ("SAB TV", "sab-tv"), "and_tv": ("And TV", "and-tv"), "dangal_tv": ("Dangal TV", "dangal-tv")}
 CHANNEL_LABELS = {"zee tv", "zeetv", "sony tv", "sonytv", "colors tv", "colors", "star plus", "starplus", "sab tv", "sabtv", "and tv", "&tv", "dangal", "dangal tv", "star bharat", "sony sab", "all serials", "latest episodes"}
 NAV_LABELS = {"home", "menu", "next", "previous", "read more", "login", "contact", "about", "privacy", "privacy policy", "dmca", "watch now", "more", "new videos"}
-MEDIA_HOSTS = {TARGET_HOST, "desiserials.ru", "showdetails.org", "showdetails.net", "vk.com", "vkvideo.ru", "vkuser.net", "streamwish.to", "streamwish.com", "filelions.to", "filelions.site", "doodstream.com", "dood.so", "streamtape.com", "streamtape.to"}
+MEDIA_HOSTS = {TARGET_HOST, "desiserials.ru", ZEE_HOST, "showdetails.org", "showdetails.net", "vk.com", "vkvideo.ru", "vkuser.net", "streamwish.to", "streamwish.com", "filelions.to", "filelions.site", "doodstream.com", "dood.so", "streamtape.com", "streamtape.to"}
 MEDIA_HOSTS.update(x.strip().lower().rstrip(".") for x in os.getenv("MEDIA_HOSTS_EXTRA", "").split(",") if x.strip())
 SITE_HEADERS = {"User-Agent": USER_AGENT, "Referer": TARGET_SITE + "/", "Accept-Language": "en-US,en;q=0.8", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
-MANIFEST = {
-    "id": "org.desiserials.streamio", "version": "7.3.0", "name": "DesiSerials TV",
-    "description": "Desi serials grouped by channel and series with real episode titles.", "logo": DEFAULT_POSTER,
-    "resources": ["catalog", "meta", "stream"], "types": ["tv"], "idPrefixes": ["dr_show_", "dr_ep_"],
-    "catalogs": [{"type": "tv", "id": "desiserials_shows", "name": "All Serials", "extra": [{"name": "search", "isRequired": False}]}, {"type": "tv", "id": "desiserials_latest", "name": "Latest Episodes", "extra": [{"name": "search", "isRequired": False}]}] + [{"type": "tv", "id": key, "name": label, "extra": [{"name": "search", "isRequired": False}]} for key, (label, _) in CHANNELS.items()],
-}
+MANIFEST = {"id": "org.desiserials.streamio", "version": "7.4.0", "name": "DesiSerials TV", "description": "Desi serials grouped by channel and series.", "logo": DEFAULT_POSTER, "resources": ["catalog", "meta", "stream"], "types": ["tv"], "idPrefixes": ["dr_show_", "dr_ep_"], "catalogs": [{"type": "tv", "id": "desiserials_shows", "name": "All Serials", "extra": [{"name": "search", "isRequired": False}]}, {"type": "tv", "id": "desiserials_latest", "name": "Latest Episodes", "extra": [{"name": "search", "isRequired": False}]}] + [{"type": "tv", "id": key, "name": label, "extra": [{"name": "search", "isRequired": False}]} for key, (label, _) in CHANNELS.items()]}
 CACHE: dict[str, tuple[float, Any]] = {}
 
 
@@ -109,7 +102,7 @@ def text_of(tag) -> str: return re.sub(r"\s+", " ", " ".join(tag.stripped_string
 def clean_title(value: str) -> str: return re.sub(r"\s+", " ", html_lib.unescape(value or "")).strip(" -|:")
 def same_site(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower().rstrip(".")
-    return host in {TARGET_HOST, "desiserials.ru"} or host.endswith("." + TARGET_HOST)
+    return host in {TARGET_HOST, "desiserials.ru", ZEE_HOST} or host.endswith("." + TARGET_HOST)
 def is_playlist(url: str) -> bool: return urlparse(url).path.lower().endswith((".m3u8", ".m3u")) or "m3u8" in url.lower()
 def proxy_link(request: Request, target: str) -> str: return f"{(PUBLIC_BASE_URL or str(request.base_url).rstrip('/')).rstrip('/')}/{'proxy/hls' if is_playlist(target) else 'proxy'}?url={encode_url(target)}"
 def page_id(value: str, prefix: str = "dr_ep_") -> str: return prefix + encode_url(value)
@@ -120,13 +113,11 @@ def id_value(value: str, prefix: str) -> str:
 
 def date_from_title(value: str) -> str | None:
     months = {name: idx for idx, names in enumerate(("january jan", "february feb", "march mar", "april apr", "may", "june jun", "july jul", "august aug", "september sep", "october oct", "november nov", "december dec"), 1) for name in names.split()}
-    patterns = (r"\b(\d{1,2})[\s,.-]+([A-Za-z]{3,9})[\s,.-]+(20\d{2})\b", r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b")
-    for n, pattern in enumerate(patterns):
+    for n, pattern in enumerate((r"\b(\d{1,2})[\s,.-]+([A-Za-z]{3,9})[\s,.-]+(20\d{2})\b", r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b")):
         m = re.search(pattern, value, re.I)
         if not m: continue
         try:
-            p = m.groups()
-            day, month, year = ((int(p[0]), months.get(p[1].lower()), int(p[2])) if n == 0 else ((int(p[2]), int(p[1]), int(p[0])) if n == 1 else (int(p[0]), int(p[1]), int(p[2]))))
+            p = m.groups(); day, month, year = ((int(p[0]), months.get(p[1].lower()), int(p[2])) if n == 0 else ((int(p[2]), int(p[1]), int(p[0])) if n == 1 else (int(p[0]), int(p[1]), int(p[2]))))
             return datetime(year, month, day).date().isoformat() if month else None
         except (TypeError, ValueError): pass
     return None
@@ -137,40 +128,20 @@ def is_episode_url(url: str, title: str = "") -> bool:
     return bool(re.search(r"episode|watch|video|serial|\bep\.?\s*\d+|\b\d{1,4}(?:st|nd|rd|th)?[- .]?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|20\d{2})", value))
 
 
-def is_channel_title(title: str) -> bool:
-    value = re.sub(r"[^a-z0-9&]+", " ", clean_title(title).lower()).strip()
-    if value in CHANNEL_LABELS or value.replace("&", "and") in {x.replace("&", "and") for x in CHANNEL_LABELS}:
-        return True
-    if any(token in value for token in ("zee tv", "zee-tv", "z tv", "zeetv")):
-        return True
-    return False
-
-
-def is_navigation(url: str, title: str) -> bool:
-    path = urlparse(url).path.lower().rstrip("/"); value = clean_title(title).lower()
-    return path in {"", "/category", "/contact", "/about", "/privacy-policy", "/dmca", "/all-serials"} or value in NAV_LABELS or value.startswith(("read more", "watch ")) or is_channel_title(value)
-
-
 def show_title(raw: str) -> str:
-    """Convert a post title into the series name used for grouping."""
     title = clean_title(raw)
-    title = title.replace("Watch Online", "").replace("watch online", "")
-    title = re.sub(r"\s*\|.*$", "", title)
-    title = re.sub(r"\s*[-–]\s*(?:Zee TV|Star Plus|Colors TV|Sony TV|SAB TV|And TV|Dangal TV).*$", "", title, flags=re.I)
-    title = re.sub(r"^(?:Zee TV|Star Plus|Colors TV|Sony TV|SAB TV|And TV|Dangal TV)\s*[:\-|–]?\s*", "", title, flags=re.I)
-    title = re.sub(r"\s*[:\-|–]?\s*(?:Watch|Watch Online|Serials|Serial)\s*$", "", title, flags=re.I)
-    title = re.sub(r"\s*[-–]\s*(?:full episode|watch.*|episode.*)$", "", title, flags=re.I)
-    title = re.sub(r"\b(?:full\s+)?episode\b.*$", "", title, flags=re.I)
-    title = re.sub(r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+)?(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+20\d{2}.*$", "", title, flags=re.I)
-    title = re.sub(r"\b20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}.*$", "", title, flags=re.I)
-    title = re.sub(r"\s+", " ", title).strip(" -|:")
+    title = re.sub(r"(?i)\s*\|.*$", "", title)
+    title = re.sub(r"(?i)\s*[-–:]\s*(?:zee\s*tv|star\s*plus|colors\s*tv|sony\s*tv|sab\s*tv|and\s*tv|dangal\s*tv).*$", "", title)
+    title = re.sub(r"(?i)^(?:zee\s*tv|star\s*plus|colors\s*tv|sony\s*tv|sab\s*tv|and\s*tv|dangal\s*tv)\s*[-:|–]?\s*", "", title)
+    title = re.sub(r"(?i)\b(?:watch\s+online|watch\s+now|full\s+episode|episode\s*\d+)\b.*$", "", title)
+    title = re.sub(r"(?i)\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+20\d{2}.*$", "", title)
+    title = re.sub(r"(?i)\s+20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}.*$", "", title)
     return clean_title(title)
 
 
-def title_like_show(title: str) -> bool:
-    value = show_title(title)
-    if not value or is_channel_title(value) or value.lower() in NAV_LABELS: return False
-    return len(value) >= 3 and bool(re.search(r"[a-zA-Z]", value))
+def is_channel_or_nav(title: str) -> bool:
+    value = re.sub(r"[^a-z0-9&]+", " ", clean_title(title).lower()).strip()
+    return value in CHANNEL_LABELS or value in NAV_LABELS or value.startswith(("read more", "watch "))
 
 
 def poster_for(anchor, base: str) -> str:
@@ -183,21 +154,25 @@ def poster_for(anchor, base: str) -> str:
     return DEFAULT_POSTER
 
 
-def episode_items(source: str, base: str) -> list[dict[str, str]]:
-    soup = BeautifulSoup(source, "html.parser"); result = []
-    containers = soup.select("article, .post, .post-item, .item, .card, .serial, .show, .movie, .grid-item, .entry") or [soup]
-    for container in containers:
-        for anchor in container.select("a[href]")[:8]:
+def zee_episode_items(source: str, base: str) -> list[dict[str, str]]:
+    """Parse only real post cards from watch.desitashan.ru/category/zee-tv/."""
+    soup = BeautifulSoup(source, "html.parser")
+    result = []
+    cards = soup.select("main article, .site-main article, article.post, article, .post, .post-item, .entry, .card") or [soup]
+    seen = set()
+    for card in cards:
+        links = card.select("h1 a[href], h2 a[href], h3 a[href], h4 a[href], .entry-title a[href], .post-title a[href], a[href]")
+        for anchor in links[:3]:
             url = normalize(anchor.get("href"), base)
-            raw = text_of(container.select_one("h1, h2, h3, h4, .entry-title, .post-title, .title, .name") or anchor)
+            raw = text_of(anchor) or anchor.get("title", "") or text_of(card.select_one("h1,h2,h3,h4,.entry-title,.post-title"))
             title = clean_title(raw)
-            if not url or not same_site(url) or not title or len(title) < 5: continue
-            if is_navigation(url, title): continue
+            if not url or url in seen or not same_site(url) or not title or is_channel_or_nav(title): continue
             if not is_episode_url(url, title): continue
-            cleaned_name = show_title(title)
-            if not title_like_show(cleaned_name): continue
-            result.append({"url": url.split("#")[0], "title": title, "show": cleaned_name, "poster": poster_for(anchor, base)})
-    return dedupe(result)
+            name = show_title(title)
+            if not name or is_channel_or_nav(name) or len(name) < 3: continue
+            seen.add(url)
+            result.append({"url": url.split("#")[0], "title": title, "show": name, "poster": poster_for(anchor, base)})
+    return result
 
 
 async def get_text(client: httpx.AsyncClient, url: str, headers: dict | None = None) -> tuple[str, str]:
@@ -211,26 +186,39 @@ async def get_text(client: httpx.AsyncClient, url: str, headers: dict | None = N
     raise last or RuntimeError("request failed")
 
 
+async def collect_zee(client: httpx.AsyncClient) -> list[tuple[str, str]]:
+    urls = [ZEE_CATEGORY] + [f"{ZEE_SOURCE}/category/zee-tv/page/{n}/" for n in range(2, 11)]
+    async def fetch(url):
+        try: return await get_text(client, url, {**SITE_HEADERS, "Referer": ZEE_SOURCE + "/"})
+        except Exception: return None
+    return [x for x in await asyncio.gather(*(fetch(url) for url in urls)) if x]
+
+
 async def collect_pages(client: httpx.AsyncClient, base: str, query: str = "", slug: str | None = None) -> list[tuple[str, str]]:
-    if slug:
-        urls = [f"{base}/category/{slug}/", f"{base}/{slug}/", f"{base}/category/{slug}/page/2/", f"{base}/category/{slug}/page/3/"]
-    else:
-        first = f"{base}/?s={quote_plus(query)}" if query else base
-        urls = [first] + [f"{base}/page/{n}/" for n in range(2, 11)] + [f"{base}/{x}/" for x in ("all-serials", "category", "tv-show", "latest-episodes", "series")]
+    first = f"{base}/?s={quote_plus(query)}" if query else base
+    urls = [first] + ([f"{base}/category/{slug}/", f"{base}/category/{slug}/page/2/", f"{base}/category/{slug}/page/3/"] if slug else [f"{base}/page/{n}/" for n in range(2, 6)])
     async def fetch(url):
         try: return await get_text(client, url)
         except Exception: return None
-    return [x for x in await asyncio.gather(*(fetch(x) for x in list(dict.fromkeys(urls))[:25])) if x]
+    return [x for x in await asyncio.gather(*(fetch(url) for url in urls)) if x]
 
 
 def grouped(items: list[dict]) -> list[dict]:
-    groups: dict[str, dict] = {}
+    groups = {}
     for item in items:
         key = re.sub(r"[^a-z0-9]+", " ", item["show"].lower()).strip()
-        if not key: continue
-        group = groups.setdefault(key, {"show": item["show"], "url": item["url"], "poster": item["poster"], "episodes": []})
-        group["episodes"].append(item)
+        if key: groups.setdefault(key, {"show": item["show"], "poster": item["poster"], "episodes": []})["episodes"].append(item)
     return list(groups.values())
+
+
+MEDIA_RE = re.compile(r"(?:https?:)?//[^\"'<>\\\s]+?(?:\.m3u8|\.mp4|\.m4v)(?:\?[^\"'<>\\\s]*)?", re.I)
+def extract_media(source: str, base: str) -> list[str]:
+    cleaned = html_lib.unescape(source).replace("\\/", "/").replace("\\u0026", "&")
+    found = [normalize(x, base) for x in MEDIA_RE.findall(cleaned)]
+    soup = BeautifulSoup(cleaned, "html.parser")
+    for tag in soup.find_all(["iframe", "video", "source", "embed"]):
+        for attr in ("src", "data-src", "data-url", "data-video", "data-file", "data-m3u8", "href"): found.append(normalize(tag.get(attr), base))
+    return list(dict.fromkeys(x for x in found if safe_url(x)))
 
 
 def gateway_links(source: str, base: str) -> list[str]:
@@ -239,14 +227,6 @@ def gateway_links(source: str, base: str) -> list[str]:
         raw = tag.get("href") or tag.get("data-url") or tag.get("data-href") or tag.get("data-video") or tag.get("data-embed"); url = normalize(raw, base); label = (text_of(tag) + " " + str(tag.get("title", "")) + " " + str(tag.get("class", ""))).lower()
         if url and safe_url(url) and any(word in label for word in ("watch", "player", "embed", "part")): result.append(url)
     return list(dict.fromkeys(result))
-
-MEDIA_RE = re.compile(r"(?:https?:)?//[^\"'<>\\\s]+?(?:\.m3u8|\.mp4|\.m4v)(?:\?[^\"'<>\\\s]*)?", re.I)
-def extract_media(source: str, base: str) -> list[str]:
-    cleaned = html_lib.unescape(source).replace("\\/", "/").replace("\\u0026", "&"); found = [normalize(x, base) for x in MEDIA_RE.findall(cleaned)]
-    soup = BeautifulSoup(cleaned, "html.parser")
-    for tag in soup.find_all(["iframe", "video", "source", "embed"]):
-        for attr in ("src", "data-src", "data-url", "data-video", "data-file", "data-m3u8", "href"): found.append(normalize(tag.get(attr), base))
-    return list(dict.fromkeys(x for x in found if safe_url(x)))
 
 
 async def streams_from_url(client: httpx.AsyncClient, url: str, referer: str, request: Request) -> list[dict]:
@@ -316,36 +296,33 @@ async def catalog(catalog_id: str, request: Request, query: str | None = None):
     if cached := cache_get(key): return cached
     channel = CHANNELS.get(catalog_id)
     if catalog_id not in {"desiserials_shows", "desiserials_latest"} and not channel: return {"metas": []}
-    items = []
-    for source, final in await collect_pages(request.app.state.http, TARGET_SITE, query, channel[1] if channel else None): items.extend(episode_items(source, final))
-    if "zee" in (catalog_id or "").lower() or (TARGET_SITE.endswith("watch.desitashan.ru") and "zee" in TARGET_SITE.lower()):
-        items = [item for item in items if not is_channel_title(item["show"])]
+    if catalog_id == "zee_tv":
+        pages = await collect_zee(request.app.state.http)
+        items = [item for source, final in pages for item in zee_episode_items(source, final)]
+    else:
+        pages = await collect_pages(request.app.state.http, TARGET_SITE, query, channel[1] if channel else None)
+        items = []
+        for source, final in pages:
+            items.extend(zee_episode_items(source, final))
     groups = grouped(dedupe(items))
-    metas = []
-    for group in groups[:MAX_CATALOG_ITEMS]:
-        token = f"{catalog_id}|{group['show']}"
-        metas.append({"id": page_id(token, "dr_show_"), "type": "tv", "name": group["show"], "poster": group["poster"], "description": f"{group['show']} episodes"})
+    metas = [{"id": page_id(f"{catalog_id}|{group['show']}", "dr_show_"), "type": "tv", "name": group["show"], "poster": group["poster"], "description": f"{group['show']} episodes"} for group in groups[:MAX_CATALOG_ITEMS]]
     result = {"metas": metas}; cache_set(key, result, 300); return result
 
 
 @app.get("/meta/tv/{id}.json")
 async def meta(id: str, request: Request):
     if cached := cache_get("meta:" + id): return cached
-    if not id.startswith("dr_show_"):
-        return {"meta": {"id": id, "type": "tv", "name": "Unknown"}}
-    token = id_value(id, "dr_show_")
-    catalog_id, wanted = token.split("|", 1) if "|" in token else ("desiserials_shows", token)
-    channel = CHANNELS.get(catalog_id)
-    items = []
-    for source, final in await collect_pages(request.app.state.http, TARGET_SITE, "", channel[1] if channel else None): items.extend(episode_items(source, final))
-    matched = [item for item in dedupe(items) if re.sub(r"[^a-z0-9]+", " ", item["show"].lower()).strip() == re.sub(r"[^a-z0-9]+", " ", wanted.lower()).strip()]
+    if not id.startswith("dr_show_"): return {"meta": {"id": id, "type": "tv", "name": "Unknown"}}
+    token = id_value(id, "dr_show_"); catalog_id, wanted = token.split("|", 1) if "|" in token else ("desiserials_shows", token)
+    if catalog_id == "zee_tv": pages = await collect_zee(request.app.state.http); items = [item for source, final in pages for item in zee_episode_items(source, final)]
+    else: pages = await collect_pages(request.app.state.http, TARGET_SITE, "", CHANNELS.get(catalog_id, ("", ""))[1] if catalog_id in CHANNELS else None); items = [item for source, final in pages for item in zee_episode_items(source, final)]
+    wanted_key = re.sub(r"[^a-z0-9]+", " ", wanted.lower()).strip(); matched = [x for x in dedupe(items) if re.sub(r"[^a-z0-9]+", " ", x["show"].lower()).strip() == wanted_key]
     videos = []
     for number, item in enumerate(matched[:MAX_VIDEOS], 1):
         video = {"id": page_id(item["url"]), "title": item["title"], "season": 1, "episode": number}
         if released := date_from_title(item["title"]): video["released"] = released
         videos.append(video)
-    poster = matched[0]["poster"] if matched else DEFAULT_POSTER
-    result = {"meta": {"id": id, "type": "tv", "name": wanted, "poster": poster, "videos": videos}}
+    result = {"meta": {"id": id, "type": "tv", "name": wanted, "poster": matched[0]["poster"] if matched else DEFAULT_POSTER, "videos": videos}}
     cache_set("meta:" + id, result, 300); return result
 
 
@@ -360,7 +337,6 @@ async def stream(id: str, request: Request):
             for attr in ("src", "data-src"):
                 candidate = normalize(tag.get(attr), final)
                 if candidate and safe_url(candidate) and candidate not in candidates: candidates.append(candidate)
-        candidates.extend(x for x in gateway_links(source, final) if x not in candidates); candidates.extend(x for x in extract_media(source, final) if x not in candidates)
         sem = asyncio.Semaphore(STREAM_CONCURRENCY)
         async def inspect(candidate):
             async with sem: return await streams_from_url(client, candidate, page, request)
