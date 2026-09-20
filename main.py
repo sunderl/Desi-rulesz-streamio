@@ -4,7 +4,9 @@ import time
 import base64
 import logging
 import asyncio
-from urllib.parse import urljoin, urlparse, unquote
+import ipaddress
+from contextlib import asynccontextmanager
+from urllib.parse import urlparse, urljoin, unquote
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
@@ -15,22 +17,10 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("desirulez")
 
-app = FastAPI()
-
-# 1. CORS CONFIGURATION
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 TARGET_SITE = "https://desiruleztv.net"
 DEFAULT_POSTER = "https://images.unsplash.com/photo-1593784991095-a205069470b6?w=500&q=80"
 
-# SSRF Protection Host Allowlist
 ALLOWED_MEDIA_HOSTS = {
     "desiruleztv.net",
     "vk.com",
@@ -54,24 +44,14 @@ POPULAR_SERIALS = [
 
 MANIFEST = {
     "id": "org.desiruleztv.production.addon",
-    "version": "4.0.0",
+    "version": "4.1.0",
     "name": "DesiRulez TV (Production)",
     "description": "Watch Indian Serials via fast parallel extraction, memory-safe streaming, and HLS proxying.",
     "resources": ["catalog", "meta", "stream"],
     "types": ["tv"],
     "catalogs": [
-        {
-            "type": "tv",
-            "id": "desirulez_popular",
-            "name": "Top Serials",
-            "extra": [{"name": "search", "isRequired": False}]
-        },
-        {
-            "type": "tv",
-            "id": "desirulez_latest",
-            "name": "Latest Daily Episodes",
-            "extra": [{"name": "search", "isRequired": False}]
-        }
+        {"type": "tv", "id": "desirulez_popular", "name": "Top Serials", "extra": [{"name": "search", "isRequired": False}]},
+        {"type": "tv", "id": "desirulez_latest", "name": "Latest Daily Episodes", "extra": [{"name": "search", "isRequired": False}]}
     ],
     "idPrefixes": ["dr_"]
 }
@@ -81,7 +61,7 @@ HEADERS = {
     "Referer": TARGET_SITE
 }
 
-# Simple In-Memory Cache TTL Store
+# Monotonic Cache Store
 CACHE_STORE: dict[str, tuple[float, dict]] = {}
 
 def get_cache(key: str) -> dict | None:
@@ -89,13 +69,62 @@ def get_cache(key: str) -> dict | None:
     if not item:
         return None
     expires_at, data = item
-    if time.time() >= expires_at:
+    if time.monotonic() >= expires_at:
         CACHE_STORE.pop(key, None)
         return None
     return data
 
 def set_cache(key: str, data: dict, ttl_seconds: int = 300) -> None:
-    CACHE_STORE[key] = (time.time() + ttl_seconds, data)
+    CACHE_STORE[key] = (time.monotonic() + ttl_seconds, data)
+
+# Shared HTTPX Client Lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(
+        headers=HEADERS,
+        follow_redirects=True,
+        timeout=httpx.Timeout(20.0, connect=8.0),
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
+    )
+    yield
+    await app.state.http.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# SSRF and URL Helpers
+def is_allowed_media_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    host = (parsed.hostname or "").lower()
+    if not host or not any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_MEDIA_HOSTS):
+        return False
+
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
+            return False
+    except ValueError:
+        pass
+
+    return True
+
+def validate_target_url(target_url: str) -> None:
+    if not is_allowed_media_url(target_url):
+        raise HTTPException(status_code=403, detail="Target media URL host is restricted or invalid")
 
 def get_base_url(request: Request) -> str:
     if PUBLIC_BASE_URL:
@@ -109,14 +138,6 @@ def decode_url(encoded_str: str) -> str:
     padding = "=" * (-len(encoded_str) % 4)
     return base64.urlsafe_b64decode(encoded_str + padding).decode()
 
-def validate_target_url(target_url: str) -> None:
-    parsed = urlparse(target_url)
-    if parsed.scheme not in {"http", "https"}:
-        raise HTTPException(status_code=400, detail="Invalid URL scheme")
-    hostname = (parsed.hostname or "").lower()
-    if not any(hostname == host or hostname.endswith("." + host) for host in ALLOWED_MEDIA_HOSTS):
-        raise HTTPException(status_code=403, detail="Media host is not in allowed domain list")
-
 def normalize_url(raw_url: str, base_url: str) -> str | None:
     if not raw_url:
         return None
@@ -125,6 +146,13 @@ def normalize_url(raw_url: str, base_url: str) -> str | None:
     if value.startswith("//"):
         value = "https:" + value
     return urljoin(base_url, value)
+
+def is_hls_url(url: str) -> bool:
+    return urlparse(url).path.lower().endswith(".m3u8")
+
+def is_media_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith((".m3u8", ".mp4", ".m4v", ".ts", ".m4s"))
 
 def parse_date_from_title(title: str) -> str | None:
     months = {
@@ -141,10 +169,23 @@ def parse_date_from_title(title: str) -> str | None:
         return f"{year}-{month}-{int(day):02d}"
     return None
 
-# 2. MEMORY-SAFE MP4 & SEGMENT STREAMING PROXY (WITH RANGE SUPPORT)
+async def fetch_text_with_retry(client: httpx.AsyncClient, url: str, retries: int = 2) -> str:
+    for attempt in range(retries + 1):
+        try:
+            res = await client.get(url, timeout=12.0)
+            res.raise_for_status()
+            return res.text
+        except (httpx.HTTPError, httpx.TimeoutException):
+            if attempt == retries:
+                raise
+            await asyncio.sleep(0.4 * (attempt + 1))
+    return ""
+
+# Media Proxy Endpoints
 @app.get("/proxy")
-async def proxy_stream(
+async def proxy_media(
     url: str,
+    request: Request,
     range_header: str | None = Header(default=None, alias="Range"),
 ):
     try:
@@ -157,41 +198,35 @@ async def proxy_stream(
     request_headers = {
         "User-Agent": HEADERS["User-Agent"],
         "Referer": TARGET_SITE,
+        "Origin": TARGET_SITE,
+        "Accept": "*/*",
     }
     if range_header:
         request_headers["Range"] = range_header
 
-    client = httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=httpx.Timeout(30.0, connect=10.0),
-    )
+    client: httpx.AsyncClient = request.app.state.http
 
     try:
-        request = client.build_request("GET", target_url, headers=request_headers)
-        response = await client.send(request, stream=True)
+        req = client.build_request("GET", target_url, headers=request_headers)
+        response = await client.send(req, stream=True)
+
+        try:
+            validate_target_url(str(response.url))
+        except HTTPException:
+            await response.aclose()
+            raise
 
         if response.status_code >= 400:
             await response.aclose()
-            await client.aclose()
-            raise HTTPException(
-                status_code=502,
-                detail=f"Upstream media server returned HTTP {response.status_code}",
-            )
+            raise HTTPException(status_code=response.status_code, detail="Upstream returned error status")
 
-        response_headers = {}
-        for header in (
-            "content-type",
-            "content-length",
-            "content-range",
-            "accept-ranges",
-            "cache-control",
-            "etag",
-            "last-modified",
-        ):
-            if header in response.headers:
-                response_headers[header] = response.headers[header]
-
-        response_headers["Access-Control-Allow-Origin"] = "*"
+        response_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+        for h in ("content-type", "content-length", "content-range", "accept-ranges", "cache-control", "etag"):
+            if h in response.headers:
+                response_headers[h] = response.headers[h]
 
         async def iterator():
             try:
@@ -199,7 +234,6 @@ async def proxy_stream(
                     yield chunk
             finally:
                 await response.aclose()
-                await client.aclose()
 
         return StreamingResponse(
             iterator(),
@@ -207,12 +241,15 @@ async def proxy_stream(
             headers=response_headers,
             media_type=response.headers.get("content-type"),
         )
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        logger.error("Proxy HTTP error for %s: %s", target_url, exc)
+        raise HTTPException(status_code=502, detail="Upstream media connection failed")
     except Exception as exc:
-        await client.aclose()
-        logger.error("Proxy failure for %s: %s", target_url, exc)
-        raise HTTPException(status_code=502, detail=str(exc))
+        logger.error("Unexpected proxy error for %s: %s", target_url, exc)
+        raise HTTPException(status_code=500, detail="Internal proxy failure")
 
-# 3. RECURSIVE HLS PLAYLIST REWRITER PROXY
 @app.get("/proxy/hls")
 async def proxy_hls(url: str, request: Request):
     try:
@@ -222,55 +259,42 @@ async def proxy_hls(url: str, request: Request):
 
     validate_target_url(playlist_url)
 
+    client: httpx.AsyncClient = request.app.state.http
+
     try:
-        async with httpx.AsyncClient(
-            headers=HEADERS,
-            follow_redirects=True,
-            timeout=httpx.Timeout(15.0, connect=8.0),
-        ) as client:
-            response = await client.get(playlist_url)
+        response = await client.get(playlist_url)
+        validate_target_url(str(response.url))
 
         if response.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Unable to load upstream HLS playlist: HTTP {response.status_code}",
-            )
+            raise HTTPException(status_code=502, detail=f"Upstream HLS returned HTTP {response.status_code}")
 
         public_base = get_base_url(request).rstrip("/")
         output_lines = []
 
         for line in response.text.splitlines():
             line_str = line.strip()
-
             if not line_str:
                 output_lines.append("")
                 continue
 
             if line_str.startswith("#"):
-                # Rewrite URI attributes (AES-128 keys, init maps) supporting single & double quotes
                 def replace_uri(match):
                     quote = match.group(1)
                     raw_uri = match.group(2)
                     full_key_url = normalize_url(raw_uri, str(response.url))
-                    if not full_key_url:
+                    if not full_key_url or not is_allowed_media_url(full_key_url):
                         return match.group(0)
                     encoded_key = encode_url(full_key_url)
                     return f'URI={quote}{public_base}/proxy?url={encoded_key}{quote}'
 
-                line_str = re.sub(
-                    r'URI\s*=\s*(["\'])(.*?)\1',
-                    replace_uri,
-                    line_str,
-                    flags=re.IGNORECASE,
-                )
+                line_str = re.sub(r'URI\s*=\s*(["\'])(.*?)\1', replace_uri, line_str, flags=re.IGNORECASE)
                 output_lines.append(line_str)
                 continue
 
-            # Segment or sub-playlist URI rewriting
             segment_url = normalize_url(line_str, str(response.url))
-            if segment_url:
+            if segment_url and is_allowed_media_url(segment_url):
                 encoded_segment = encode_url(segment_url)
-                if ".m3u8" in line_str.lower() or "m3u8" in segment_url.lower():
+                if is_hls_url(segment_url):
                     output_lines.append(f"{public_base}/proxy/hls?url={encoded_segment}")
                 else:
                     output_lines.append(f"{public_base}/proxy?url={encoded_segment}")
@@ -280,15 +304,18 @@ async def proxy_hls(url: str, request: Request):
         return Response(
             content="\n".join(output_lines),
             media_type="application/vnd.apple.mpegurl",
-            headers={
-                "Cache-Control": "no-cache",
-                "Access-Control-Allow-Origin": "*",
-            },
+            headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
         )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("HLS Proxy error for %s: %s", playlist_url, exc)
+        raise HTTPException(status_code=502, detail="HLS playlist rewriting failed")
 
-    except httpx.HTTPError as exc:
-        logger.error("HLS Playlist Proxy error: %s", exc)
-        raise HTTPException(status_code=502, detail=str(exc))
+# Addon Routes
+@app.get("/health")
+def health():
+    return {"status": "ok", "public_base_url": PUBLIC_BASE_URL or "dynamic"}
 
 @app.get("/")
 def home():
@@ -298,10 +325,9 @@ def home():
 def manifest():
     return MANIFEST
 
-# 4. CATALOGS & SEARCH
 @app.get("/catalog/tv/{catalog_id}.json")
 @app.get("/catalog/tv/{catalog_id}/search={query}.json")
-async def catalog(catalog_id: str, query: str = None):
+async def catalog_tv(catalog_id: str, request: Request, query: str = None):
     cache_key = f"catalog:{catalog_id}:{query or 'all'}"
     cached = get_cache(cache_key)
     if cached:
@@ -312,133 +338,106 @@ async def catalog(catalog_id: str, query: str = None):
 
     if catalog_id == "desirulez_popular" and not query:
         for show in POPULAR_SERIALS:
-            cat_id = f"dr_cat_{encode_url(show['url'])}"
             metas.append({
-                "id": cat_id,
+                "id": f"dr_cat_{encode_url(show['url'])}",
                 "type": "tv",
                 "name": show["name"],
                 "poster": show["poster"],
-                "description": f"Date-wise episodes for {show['name']}"
+                "description": f"Episodes for {show['name']}"
             })
         res_payload = {"metas": metas}
         set_cache(cache_key, res_payload, ttl_seconds=600)
         return res_payload
 
     target_fetch_url = f"{TARGET_SITE}/?s={query.replace(' ', '+')}" if query else TARGET_SITE
+    client: httpx.AsyncClient = request.app.state.http
 
     try:
-        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=12.0) as client:
-            res = await client.get(target_fetch_url)
-            soup = BeautifulSoup(res.text, "html.parser")
-            
-            for a in soup.find_all("a", href=True):
-                full_url = normalize_url(a["href"], TARGET_SITE)
-                title = a.text.strip()
+        html = await fetch_text_with_retry(client, target_fetch_url)
+        soup = BeautifulSoup(html, "html.parser")
+
+        for a in soup.find_all("a", href=True):
+            full_url = normalize_url(a["href"], TARGET_SITE)
+            title = a.text.strip()
+
+            if not full_url or full_url in seen_urls or any(full_url.lower().endswith(ext) for ext in (".jpg", ".png", ".pdf", ".css", ".js")):
+                continue
+
+            if any(token in full_url.lower() for token in ("/episode", "/watch-online", "-episode-", "/serial/")) and len(title) > 5:
+                seen_urls.add(full_url)
                 
-                if not full_url or full_url in seen_urls:
-                    continue
-                
-                if any(kw in full_url.lower() for kw in ["/episode", "/watch-online", "-episode-"]) and len(title) > 8:
-                    seen_urls.add(full_url)
-                    ep_id = f"dr_ep_{encode_url(full_url)}"
-                    
-                    img_tag = a.find("img") or (a.parent.find("img") if a.parent else None)
-                    poster = DEFAULT_POSTER
-                    if img_tag:
-                        src = img_tag.get("src") or img_tag.get("data-src")
-                        normalized_img = normalize_url(src, TARGET_SITE)
-                        if normalized_img:
-                            poster = normalized_img
-                    
-                    metas.append({
-                        "id": ep_id,
-                        "type": "tv",
-                        "name": title,
-                        "poster": poster,
-                        "description": f"Episode: {title}"
-                    })
+                img_tag = a.find("img") or (a.parent.find("img") if a.parent else None)
+                poster = DEFAULT_POSTER
+                if img_tag:
+                    src = img_tag.get("src") or img_tag.get("data-src") or img_tag.get("data-lazy-src")
+                    normalized_img = normalize_url(src, TARGET_SITE)
+                    if normalized_img:
+                        poster = normalized_img
+
+                metas.append({
+                    "id": f"dr_ep_{encode_url(full_url)}",
+                    "type": "tv",
+                    "name": title,
+                    "poster": poster,
+                    "description": title
+                })
     except Exception as e:
-        logger.error("Catalog Error: %s", e)
+        logger.error("Catalog Fetch Error (%s): %s", target_fetch_url, e)
 
     res_payload = {"metas": metas[:40]}
     set_cache(cache_key, res_payload, ttl_seconds=300)
     return res_payload
 
-# 5. METADATA ENDPOINTS
 @app.get("/meta/tv/{id}.json")
-async def meta(id: str):
+async def meta_tv(id: str, request: Request):
     cache_key = f"meta:{id}"
     cached = get_cache(cache_key)
     if cached:
         return cached
 
+    client: httpx.AsyncClient = request.app.state.http
+
     if id.startswith("dr_cat_"):
-        encoded_url = id.replace("dr_cat_", "")
         try:
-            category_url = decode_url(encoded_url)
+            category_url = decode_url(id.replace("dr_cat_", ""))
         except Exception:
             category_url = TARGET_SITE
 
         videos = []
         seen_urls = set()
-        
-        show_name = "Indian Serial"
-        show_poster = DEFAULT_POSTER
-        for show in POPULAR_SERIALS:
-            if show["url"] == category_url:
-                show_name = show["name"]
-                show_poster = show["poster"]
-                break
+        show_name = next((s["name"] for s in POPULAR_SERIALS if s["url"] == category_url), "Indian Serial")
+        show_poster = next((s["poster"] for s in POPULAR_SERIALS if s["url"] == category_url), DEFAULT_POSTER)
 
         try:
-            async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=12.0) as client:
-                res = await client.get(category_url)
-                soup = BeautifulSoup(res.text, "html.parser")
-                
-                ep_idx = 1
-                for a in soup.find_all("a", href=True):
-                    full_url = normalize_url(a["href"], TARGET_SITE)
-                    title = a.text.strip()
-                    
-                    if not full_url or full_url in seen_urls:
-                        continue
-                        
-                    if any(kw in full_url.lower() for kw in ["/episode", "/watch-online", "-episode-"]) and len(title) > 8:
-                        seen_urls.add(full_url)
-                        ep_id = f"dr_ep_{encode_url(full_url)}"
-                        
-                        released_date = parse_date_from_title(title)
-                        video_obj = {
-                            "id": ep_id,
-                            "title": title,
-                            "season": 1,
-                            "episode": ep_idx,
-                        }
-                        if released_date:
-                            video_obj["released"] = released_date
-                            
-                        videos.append(video_obj)
-                        ep_idx += 1
-        except Exception as e:
-            logger.error("Meta Category Fetch Error: %s", e)
+            html = await fetch_text_with_retry(client, category_url)
+            soup = BeautifulSoup(html, "html.parser")
+            
+            ep_idx = 1
+            for a in soup.find_all("a", href=True):
+                full_url = normalize_url(a["href"], TARGET_SITE)
+                title = a.text.strip()
 
-        res_payload = {
-            "meta": {
-                "id": id,
-                "type": "tv",
-                "name": show_name,
-                "poster": show_poster,
-                "description": f"All date-wise episodes for {show_name}",
-                "videos": videos[:60]
-            }
-        }
+                if not full_url or full_url in seen_urls:
+                    continue
+
+                if any(token in full_url.lower() for token in ("/episode", "/watch-online", "-episode-")) and len(title) > 5:
+                    seen_urls.add(full_url)
+                    released_date = parse_date_from_title(title)
+                    item = {"id": f"dr_ep_{encode_url(full_url)}", "title": title, "season": 1, "episode": ep_idx}
+                    if released_date:
+                        item["released"] = released_date
+                    videos.append(item)
+                    ep_idx += 1
+        except Exception as e:
+            logger.error("Meta Category Error (%s): %s", category_url, e)
+
+        res_payload = {"meta": {"id": id, "type": "tv", "name": show_name, "poster": show_poster, "description": f"Episodes for {show_name}", "videos": videos[:60]}}
         set_cache(cache_key, res_payload, ttl_seconds=300)
         return res_payload
 
     elif id.startswith("dr_ep_"):
-        encoded_url = id.replace("dr_ep_", "")
         try:
-            ep_url = decode_url(encoded_url)
+            ep_url = decode_url(id.replace("dr_ep_", ""))
         except Exception:
             ep_url = TARGET_SITE
 
@@ -446,182 +445,128 @@ async def meta(id: str):
         released_date = None
 
         try:
-            async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=10.0) as client:
-                res = await client.get(ep_url)
-                soup = BeautifulSoup(res.text, "html.parser")
-                h1 = soup.find("h1")
-                if h1:
-                    title = h1.text.strip()
-                    released_date = parse_date_from_title(title)
+            html = await fetch_text_with_retry(client, ep_url)
+            soup = BeautifulSoup(html, "html.parser")
+            h1 = soup.find("h1")
+            if h1:
+                title = h1.text.strip()
+                released_date = parse_date_from_title(title)
         except Exception:
             pass
 
-        video_item = {
-            "id": id,
-            "title": title,
-            "season": 1,
-            "episode": 1
-        }
+        item = {"id": id, "title": title, "season": 1, "episode": 1}
         if released_date:
-            video_item["released"] = released_date
+            item["released"] = released_date
 
-        res_payload = {
-            "meta": {
-                "id": id,
-                "type": "tv",
-                "name": title,
-                "poster": DEFAULT_POSTER,
-                "description": f"Watch {title} in HD Direct Stream",
-                "videos": [video_item]
-            }
-        }
+        res_payload = {"meta": {"id": id, "type": "tv", "name": title, "poster": DEFAULT_POSTER, "description": title, "videos": [item]}}
         set_cache(cache_key, res_payload, ttl_seconds=300)
         return res_payload
 
     return {"meta": {"id": id, "type": "tv", "name": "Unknown"}}
 
-# 6. PARALLEL & SPECIFIC MEDIA EXTRACTION
-async def extract_direct_media(
-    embed_url: str,
-    client: httpx.AsyncClient,
-    base_url: str,
-    referer: str,
-) -> list[dict]:
+def extract_media_urls(html: str, page_url: str) -> list[str]:
+    html = html.replace("\\/", "/").replace("\\u0026", "&").replace("\\u003F", "?").replace("\\u003d", "=")
+    candidates = set()
+
+    for match in re.findall(r"""["']([^"']+)["']""", html):
+        if any(ext in match.lower() for ext in (".m3u8", ".mp4", ".m4v")):
+            full_url = normalize_url(match, page_url)
+            if full_url and is_media_url(full_url):
+                candidates.add(full_url)
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(["video", "source"]):
+        for attr in ("src", "data-src", "data-video", "data-file"):
+            raw_url = tag.get(attr)
+            full_url = normalize_url(raw_url, page_url)
+            if full_url and is_media_url(full_url):
+                candidates.add(full_url)
+
+    return list(candidates)
+
+async def extract_direct_streams(embed_url: str, client: httpx.AsyncClient, base_url: str, referer: str) -> list[dict]:
     found_streams = []
-    request_headers = {
-        "User-Agent": HEADERS["User-Agent"],
-        "Referer": referer,
-        "Origin": TARGET_SITE,
-    }
+    headers = {"User-Agent": HEADERS["User-Agent"], "Referer": referer, "Origin": TARGET_SITE}
 
     try:
-        res = await client.get(embed_url, headers=request_headers, timeout=8.0)
+        res = await client.get(embed_url, headers=headers, timeout=8.0)
         if res.status_code >= 400:
             return []
 
-        html = res.text.replace("\\/", "/").replace("\\u0026", "&")
+        for normalized in extract_media_urls(res.text, str(res.url)):
+            if not is_allowed_media_url(normalized):
+                continue
 
-        # Robust regex matching for .m3u8 playlists
-        m3u8_matches = re.findall(
-            r'https?://[^"\'\s<>]+?\.m3u8(?:\?[^"\'\s<>]*)?',
-            html,
-            flags=re.IGNORECASE,
-        )
-        for link in m3u8_matches:
-            normalized = normalize_url(link, str(res.url))
-            if normalized:
-                proxy_link = f"{base_url}proxy/hls?url={encode_url(normalized)}"
-                if proxy_link not in [s["url"] for s in found_streams]:
-                    found_streams.append({
-                        "name": "DesiRulez",
-                        "title": "HLS Stream",
-                        "url": proxy_link,
-                        "behaviorHints": {
-                            "bingeGroup": "desirulez-hls"
-                        }
-                    })
+            encoded_media = encode_url(normalized)
+            if is_hls_url(normalized):
+                proxy_link = f"{base_url}proxy/hls?url={encoded_media}"
+                title = "HLS Stream"
+                hints = {"bingeGroup": "desirulez-hls"}
+            else:
+                proxy_link = f"{base_url}proxy?url={encoded_media}"
+                title = "MP4 Stream"
+                hints = {"notWebReady": False}
 
-        # Robust regex matching for .mp4 media
-        mp4_matches = re.findall(
-            r'https?://[^"\'\s<>]+?\.mp4(?:\?[^"\'\s<>]*)?',
-            html,
-            flags=re.IGNORECASE,
-        )
-        for link in mp4_matches:
-            normalized = normalize_url(link, str(res.url))
-            if normalized:
-                proxy_link = f"{base_url}proxy?url={encode_url(normalized)}"
-                if proxy_link not in [s["url"] for s in found_streams]:
-                    found_streams.append({
-                        "name": "DesiRulez",
-                        "title": "MP4 Stream",
-                        "url": proxy_link,
-                        "behaviorHints": {
-                            "notWebReady": False
-                        }
-                    })
-
+            if proxy_link not in [s["url"] for s in found_streams]:
+                found_streams.append({"name": "DesiRulez", "title": title, "url": proxy_link, "behaviorHints": hints})
     except Exception as e:
-        logger.warning("Deep extract error for %s: %s", embed_url, e)
+        logger.warning("Stream extraction failed for %s: %s", embed_url, e)
 
     return found_streams
 
-# 7. PARALLEL BOUNDED STREAM DISCOVERY
 @app.get("/stream/tv/{id}.json")
-async def stream(id: str, request: Request):
+async def stream_tv(id: str, request: Request):
     if not id.startswith("dr_ep_"):
         return {"streams": []}
 
-    cached = get_cache(f"stream:{id}")
+    cache_key = f"stream:{id}"
+    cached = get_cache(cache_key)
     if cached:
         return cached
 
-    encoded_url = id.replace("dr_ep_", "")
     try:
-        page_url = decode_url(encoded_url)
-    except Exception as e:
-        logger.error("URL Decode error: %s", e)
+        page_url = decode_url(id.replace("dr_ep_", ""))
+    except Exception:
         return {"streams": []}
 
     base_server_url = get_base_url(request)
+    client: httpx.AsyncClient = request.app.state.http
     streams = []
 
     try:
-        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=12.0) as client:
-            res = await client.get(page_url)
-            soup = BeautifulSoup(res.text, "html.parser")
+        html = await fetch_text_with_retry(client, page_url)
+        soup = BeautifulSoup(html, "html.parser")
 
-            # Extract iframe sources without restrictive hardcoded domain filters
-            iframe_urls = []
-            for iframe in soup.find_all("iframe", src=True):
-                src = normalize_url(iframe["src"].strip(), page_url)
-                if src and src not in iframe_urls:
-                    iframe_urls.append(src)
+        iframe_urls = []
+        for iframe in soup.find_all("iframe", src=True):
+            src = normalize_url(iframe["src"].strip(), page_url)
+            if src and src not in iframe_urls:
+                iframe_urls.append(src)
 
-            # Bounded async concurrency (max 4 parallel provider requests)
-            semaphore = asyncio.Semaphore(4)
+        semaphore = asyncio.Semaphore(4)
+        async def extract_one(src_url: str):
+            async with semaphore:
+                return await extract_direct_streams(src_url, client, base_server_url, page_url)
 
-            async def extract_one(src_url: str):
-                async with semaphore:
-                    return await extract_direct_media(
-                        embed_url=src_url,
-                        client=client,
-                        base_url=base_server_url,
-                        referer=page_url,
-                    )
+        results = await asyncio.gather(*[extract_one(src) for src in iframe_urls[:8]], return_exceptions=True)
+        for res in results:
+            if isinstance(res, list):
+                streams.extend(res)
 
-            tasks = [extract_one(src) for src in iframe_urls]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error("Provider extraction task failed: %s", result)
-                    continue
-                streams.extend(result)
-
-            # Inspect primary page scripts directly
-            page_direct_streams = await extract_direct_media(
-                embed_url=page_url,
-                client=client,
-                base_url=base_server_url,
-                referer=TARGET_SITE,
-            )
-            streams.extend(page_direct_streams)
-
+        direct_streams = await extract_direct_streams(page_url, client, base_server_url, TARGET_SITE)
+        streams.extend(direct_streams)
     except Exception as e:
-        logger.error("Stream Scraping Error for %s: %s", page_url, e)
+        logger.error("Stream extraction failed for page %s: %s", page_url, e)
 
-    # Deduplicate streams
     unique_streams = []
-    seen_urls = set()
+    seen = set()
     for s in streams:
-        u = s.get("url")
-        if u and u not in seen_urls:
-            seen_urls.add(u)
+        if s["url"] not in seen:
+            seen.add(s["url"])
             unique_streams.append(s)
 
-    res_payload = {"streams": unique_streams}
+    res_payload = {"streams": unique_streams[:20]}
     if unique_streams:
-        set_cache(f"stream:{id}", res_payload, ttl_seconds=120)
+        set_cache(cache_key, res_payload, ttl_seconds=120)
 
     return res_payload
