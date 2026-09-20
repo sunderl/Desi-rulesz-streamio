@@ -1,14 +1,16 @@
 import asyncio
 import base64
 import binascii
+import html as html_lib
 import ipaddress
 import logging
 import os
 import re
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import quote_plus, unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -16,99 +18,74 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
+# DesiSerials is a WordPress-like site whose theme has changed several times.
+# The scraper deliberately relies on semantic URL/text signals as well as the
+# common article/card markup, instead of one brittle CSS class.
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("desirulez")
+logger = logging.getLogger("desiserials")
 
-TARGET_SITE = os.getenv("TARGET_SITE", "https://desiruleztv.net").rstrip("/")
+TARGET_SITE = os.getenv("TARGET_SITE", "https://www.desiserials.ru").rstrip("/")
+TARGET_HOST = (urlparse(TARGET_SITE).hostname or "www.desiserials.ru").lower()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DEFAULT_POSTER = os.getenv(
     "DEFAULT_POSTER",
     "https://images.unsplash.com/photo-1593784991095-a205069470b6?w=500&q=80",
 )
-
-MAX_URL_LENGTH = 2048
-MAX_CATALOG_ITEMS = 60
-MAX_STREAMS_PER_REQUEST = 30
-MAX_HTTP_RETRIES = 3
-STREAM_CANDIDATES_LIMIT = 12
-STREAM_CONCURRENCY = 6
-
-ALLOWED_MEDIA_HOSTS = {
-    "desiruleztv.net",
-    "vk.com",
-    "vkvideo.ru",
-    "vkprime.com",
-    "streamwish.to",
-    "streamwish.com",
-    "filelions.to",
-    "filelions.site",
-    "doodstream.com",
-    "dood.so",
-    "streamtape.com",
-    "streamtape.site",
-    "vidoza.net",
-    "vidsrc.me",
-    "akamaized.net",
-    "cloudfront.net",
-}
-
-POPULAR_SERIALS = [
-    {
-        "name": "Anupamaa",
-        "url": f"{TARGET_SITE}/category/anupama/",
-        "poster": "https://upload.wikimedia.org/wikipedia/en/8/80/Anupamaa_TV_Series.jpg",
-    },
-    {
-        "name": "Yeh Rishta Kya Kehlata Hai",
-        "url": f"{TARGET_SITE}/category/yeh-rishta-kya-kehlata-hai/",
-        "poster": DEFAULT_POSTER,
-    },
-    {
-        "name": "Taarak Mehta Ka Ooltah Chashmah",
-        "url": f"{TARGET_SITE}/category/taarak-mehta-ka-ooltah-chashmah/",
-        "poster": DEFAULT_POSTER,
-    },
-]
-
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 )
+
+MAX_URL_LENGTH = 4096
+MAX_CATALOG_ITEMS = 80
+MAX_VIDEOS = 150
+MAX_STREAMS_PER_REQUEST = 30
+MAX_HTTP_RETRIES = 3
+STREAM_CANDIDATES_LIMIT = 20
+STREAM_CONCURRENCY = 6
+
+# Keep this explicit to prevent the proxy becoming an open SSRF proxy. Add a
+# provider/CDN domain with MEDIA_HOSTS=host1,host2 when the site changes hosts.
+DEFAULT_MEDIA_HOSTS = {
+    TARGET_HOST,
+    "desiserials.ru",
+    "vk.com", "vkvideo.ru", "vkuser.net",
+    "streamwish.to", "streamwish.com", "filelions.to", "filelions.site",
+    "doodstream.com", "dood.so", "streamtape.com", "streamtape.site",
+    "vidoza.net", "vidsrc.me", "dailymotion.com", "dmcdn.net",
+    "ok.ru", "odnoklassniki.ru", "mega.nz", "mixdrop.co", "mixdrop.to",
+    "akamaized.net", "cloudfront.net", "googlevideo.com", "gvideo.com",
+}
+ALLOWED_MEDIA_HOSTS = DEFAULT_MEDIA_HOSTS | {
+    x.strip().lower().rstrip(".")
+    for x in os.getenv("MEDIA_HOSTS", "").split(",")
+    if x.strip()
+}
+
 SITE_HEADERS = {
     "User-Agent": USER_AGENT,
     "Referer": TARGET_SITE + "/",
     "Accept-Language": "en-US,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 MANIFEST = {
-    "id": "org.desiruleztv.production.addon",
-    "version": "5.1.0",
-    "name": "DesiRulez TV",
-    "description": "Indian TV catalog with resilient extraction and safe HLS/HTTP proxying.",
+    "id": "org.desiserials.streamio",
+    "version": "6.0.0",
+    "name": "DesiSerials TV",
+    "description": "DesiSerials catalog with resilient episode and HLS extraction.",
     "logo": DEFAULT_POSTER,
     "resources": ["catalog", "meta", "stream"],
     "types": ["tv"],
     "idPrefixes": ["dr_"],
     "catalogs": [
-        {
-            "type": "tv",
-            "id": "desirulez_popular",
-            "name": "Top Serials",
-            "extra": [{"name": "search", "isRequired": False}],
-        },
-        {
-            "type": "tv",
-            "id": "desirulez_latest",
-            "name": "Latest Episodes",
-            "extra": [{"name": "search", "isRequired": False}],
-        },
+        {"type": "tv", "id": "desiserials_shows", "name": "DesiSerials Shows",
+         "extra": [{"name": "search", "isRequired": False}]},
+        {"type": "tv", "id": "desiserials_latest", "name": "Latest Episodes",
+         "extra": [{"name": "search", "isRequired": False}]},
     ],
 }
-
 CACHE: dict[str, tuple[float, Any]] = {}
 
 
@@ -126,42 +103,36 @@ def cache_set(key: str, value: Any, ttl: int) -> None:
     CACHE[key] = (time.monotonic() + ttl, value)
 
 
-def dedupe_preserve_order(items: list[dict]) -> list[dict]:
-    unique, seen = [], set()
+def dedupe(items: list[dict], key: str = "url") -> list[dict]:
+    seen, result = set(), []
     for item in items:
-        key = item.get("url") or item.get("id")
-        if key and key in seen:
+        value = item.get(key) or item.get("id")
+        if value and value in seen:
             continue
-        if key:
-            seen.add(key)
-        unique.append(item)
-    return unique
+        if value:
+            seen.add(value)
+        result.append(item)
+    return result
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient(
-        headers=SITE_HEADERS,
-        follow_redirects=True,
-        timeout=httpx.Timeout(18.0, connect=7.0, read=15.0),
+        headers=SITE_HEADERS, follow_redirects=True,
+        timeout=httpx.Timeout(20.0, connect=8.0, read=16.0),
         limits=httpx.Limits(max_connections=80, max_keepalive_connections=30),
     )
     yield
     await app.state.http.aclose()
 
 
-app = FastAPI(title="DesiRulez TV Addon", version=MANIFEST["version"], lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "HEAD", "OPTIONS"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="DesiSerials TV Addon", version=MANIFEST["version"], lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+                   allow_methods=["GET", "HEAD", "OPTIONS"], allow_headers=["*"])
 
 
 # -----------------------------------------------------------------------------
-# URL, encoding and safety helpers
+# Safe URL and Stremio ID helpers
 # -----------------------------------------------------------------------------
 def encode_url(value: str) -> str:
     return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
@@ -169,8 +140,7 @@ def encode_url(value: str) -> str:
 
 def decode_url(value: str) -> str:
     try:
-        padded = value + "=" * (-len(value) % 4)
-        return base64.urlsafe_b64decode(padded.encode()).decode()
+        return base64.urlsafe_b64decode((value + "=" * (-len(value) % 4)).encode()).decode()
     except (binascii.Error, UnicodeError, ValueError) as exc:
         raise HTTPException(400, "Malformed URL token") from exc
 
@@ -183,17 +153,12 @@ def host_allowed(url: str) -> bool:
         host = (parsed.hostname or "").lower().rstrip(".")
         if parsed.scheme not in {"http", "https"} or not host:
             return False
-        if not any(host == x or host.endswith("." + x) for x in ALLOWED_MEDIA_HOSTS):
+        if not any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_MEDIA_HOSTS):
             return False
         try:
             address = ipaddress.ip_address(host)
-            if (
-                address.is_private
-                or address.is_loopback
-                or address.is_link_local
-                or address.is_reserved
-                or address.is_multicast
-            ):
+            if any((address.is_private, address.is_loopback, address.is_link_local,
+                    address.is_reserved, address.is_multicast)):
                 return False
         except ValueError:
             pass
@@ -202,43 +167,39 @@ def host_allowed(url: str) -> bool:
         return False
 
 
-def safe_media_url(url: str) -> str | None:
-    return url if host_allowed(url) else None
+def safe_url(url: str | None) -> str | None:
+    return url if url and host_allowed(url) else None
 
 
 def normalize(raw: str | None, base: str) -> str | None:
     if not raw:
         return None
-    value = str(raw).strip().strip("\"'")
-    value = value.replace("\\/", "/").replace("\\u0026", "&")
-    value = value.replace("\\u003F", "?").replace("\\u003f", "?")
-    value = value.replace("\\u003D", "=").replace("\\u003d", "=")
+    value = html_lib.unescape(str(raw)).strip().strip("\"'")
+    value = (value.replace("\\/", "/").replace("\\u0026", "&")
+             .replace("\\u003F", "?").replace("\\u003f", "?")
+             .replace("\\u003D", "=").replace("\\u003d", "="))
     value = unquote(value)
     if value.startswith("//"):
         value = "https:" + value
-    normalized = urljoin(base, value)
-    return normalized if normalized else None
+    return urljoin(base, value) or None
 
 
 def is_playlist(url: str) -> bool:
-    return urlparse(url).path.lower().endswith((".m3u8", ".m3u")) or "m3u8" in url.lower()
+    lower = url.lower()
+    return urlparse(url).path.lower().endswith((".m3u8", ".m3u")) or "m3u8" in lower
 
 
 def public_base(request: Request) -> str:
-    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
-    forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
-    if forwarded_host:
-        return f"{forwarded_proto or request.url.scheme}://{forwarded_host}/"
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    forwarded = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    if forwarded:
+        return f"{proto or request.url.scheme}://{forwarded}/"
     return (PUBLIC_BASE_URL or str(request.base_url).rstrip("/")).rstrip("/") + "/"
 
 
 def proxy_link(request: Request, target: str) -> str:
-    if not target:
-        return ""
-    encoded = encode_url(target)
-    if is_playlist(target):
-        return f"{public_base(request)}proxy/hls?url={encoded}"
-    return f"{public_base(request)}proxy?url={encoded}"
+    route = "proxy/hls" if is_playlist(target) else "proxy"
+    return f"{public_base(request)}{route}?url={encode_url(target)}"
 
 
 def page_id(url: str, prefix: str = "dr_ep_") -> str:
@@ -252,250 +213,229 @@ def id_url(value: str, prefix: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Source parsing
+# DesiSerials parsing
 # -----------------------------------------------------------------------------
 def text_of(tag) -> str:
-    return " ".join(tag.stripped_strings) if tag else ""
+    return re.sub(r"\s+", " ", " ".join(tag.stripped_strings)).strip() if tag else ""
+
+
+def clean_title(value: str) -> str:
+    return re.sub(r"\s+", " ", html_lib.unescape(value)).strip(" -|:")
 
 
 def title_from_page(soup: BeautifulSoup, fallback: str = "Serial Episode") -> str:
-    for selector in ("h1", "article h1", ".entry-title", ".post-title", "title"):
+    for selector in ("h1", ".entry-title", ".post-title", "article h1", "meta[property='og:title']", "title"):
         tag = soup.select_one(selector)
-        value = text_of(tag)
+        value = tag.get("content", "") if tag and tag.name == "meta" else text_of(tag)
         if value:
-            return value
+            return clean_title(value)
     return fallback
 
 
 def date_from_title(value: str) -> str | None:
-    months = {name.lower(): number for number, names in enumerate(
-        (
-            "january jan",
-            "february feb",
-            "march mar",
-            "april apr",
-            "may",
-            "june jun",
-            "july jul",
-            "august aug",
-            "september sep",
-            "october oct",
-            "november nov",
-            "december dec",
-        ),
-        1,
-    ) for name in names.split()}
-    match = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?[\s,.-]+([A-Za-z]+)[\s,.-]+(\d{4})\b", value, re.I)
-    if not match:
-        return None
-    day, month, year = match.groups()
-    month_number = months.get(month.lower())
-    return f"{year}-{month_number}-{int(day):02d}" if month_number else None
-
-
-def is_episode_url(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    return any(x in path for x in ("/episode", "/watch-online", "-episode-", "/serial/", "/videos/"))
+    patterns = [
+        r"\b(\d{1,2})[\s,.-]+([A-Za-z]{3,9})[\s,.-]+(20\d{2})\b",
+        r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b",
+        r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b",
+    ]
+    months = {name: number for number, names in enumerate(
+        ("january jan", "february feb", "march mar", "april apr", "may",
+         "june jun", "july jul", "august aug", "september sep", "october oct",
+         "november nov", "december dec"), 1) for name in names.split()}
+    for index, pattern in enumerate(patterns):
+        match = re.search(pattern, value, re.I)
+        if not match:
+            continue
+        parts = match.groups()
+        try:
+            if index == 0:
+                day, month, year = int(parts[0]), months.get(parts[1].lower()), int(parts[2])
+            elif index == 1:
+                year, month, day = map(int, parts)
+            else:
+                day, month, year = map(int, parts)
+            if month:
+                return datetime(year, month, day).date().isoformat()
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def poster_for(anchor, base: str) -> str:
     image = anchor.find("img") or (anchor.parent.find("img") if anchor.parent else None)
     if image:
-        for key in ("data-src", "data-lazy-src", "src", "data-original"):
-            value = normalize(image.get(key), base)
+        for key in ("data-src", "data-lazy-src", "data-original", "src", "srcset"):
+            raw = image.get(key)
+            if key == "srcset" and raw:
+                raw = raw.split(",")[0].strip().split(" ")[0]
+            value = normalize(raw, base)
             if value:
                 return value
     return DEFAULT_POSTER
 
 
-def episode_links(html: str, base: str) -> list[dict[str, str]]:
-    soup = BeautifulSoup(html, "html.parser")
-    result, seen = [], set()
+def same_site(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == TARGET_HOST or host.endswith("." + TARGET_HOST) or host == "desiserials.ru"
+
+
+def is_episode_url(url: str, title: str = "") -> bool:
+    path = urlparse(url).path.lower()
+    text = (path + " " + title).replace("_", "-")
+    return bool(re.search(r"episode|watch|serial|video|\bep\.?\s*\d+|\b\d{1,4}\b", text))
+
+
+def is_navigation(url: str, title: str) -> bool:
+    path = urlparse(url).path.lower().rstrip("/")
+    if path in {"", "/category", "/contact", "/about", "/privacy-policy", "/dmca"}:
+        return True
+    return clean_title(title).lower() in {"home", "menu", "next", "previous", "read more", "login"}
+
+
+def episode_links(source: str, base: str) -> list[dict[str, str]]:
+    soup = BeautifulSoup(source, "html.parser")
+    result = []
     for anchor in soup.select("a[href]"):
         url = normalize(anchor.get("href"), base)
-        title = text_of(anchor)
-        if not url or url in seen or len(title) < 4 or not is_episode_url(url):
+        title = clean_title(text_of(anchor) or anchor.get("title", ""))
+        if not url or not same_site(url) or not title or len(title) < 3 or is_navigation(url, title):
             continue
-        if urlparse(url).netloc.lower() != urlparse(TARGET_SITE).netloc.lower():
+        if is_episode_url(url, title):
+            result.append({"url": url.split("#", 1)[0], "title": title, "poster": poster_for(anchor, base)})
+    return dedupe(result)
+
+
+def show_links(source: str, base: str) -> list[dict[str, str]]:
+    soup = BeautifulSoup(source, "html.parser")
+    result = []
+    for anchor in soup.select("article a[href], .item a[href], .post a[href], .card a[href], a[href]"):
+        url = normalize(anchor.get("href"), base)
+        title = clean_title(text_of(anchor) or anchor.get("title", ""))
+        if not url or not same_site(url) or not title or len(title) < 3 or is_navigation(url, title):
             continue
-        seen.add(url)
-        result.append({"url": url, "title": title, "poster": poster_for(anchor, base)})
-    return result
+        path = urlparse(url).path.lower()
+        if is_episode_url(url, title) or path.count("/") > 3:
+            continue
+        result.append({"url": url.split("#", 1)[0], "title": title, "poster": poster_for(anchor, base)})
+    return dedupe(result)
 
 
-MEDIA_RE = re.compile(r"(?:https?:)?//[^\"'<>\\ ]+?(?:\.m3u8|\.mp4|\.m4v)(?:\?[^\"'<>\\ ]*)?", re.I)
+MEDIA_RE = re.compile(r"(?:https?:)?//[^\"'<>\\\s]+?(?:\.m3u8|\.mp4|\.m4v)(?:\?[^\"'<>\\\s]*)?", re.I)
 
 
-def extract_media(html: str, base: str) -> list[str]:
-    cleaned = (
-        html.replace("\\/", "/")
-        .replace("\\u0026", "&")
-        .replace("\\u003F", "?")
-        .replace("\\u003f", "?")
-        .replace("\\u003D", "=")
-        .replace("\\u003d", "=")
-    )
-    candidates: set[str] = set()
-
+def extract_media(source: str, base: str) -> list[str]:
+    cleaned = html_lib.unescape(source).replace("\\/", "/").replace("\\u0026", "&")
+    candidates: list[str] = []
     for raw in MEDIA_RE.findall(cleaned):
-        url = normalize(raw, base)
-        if url and safe_media_url(url):
-            candidates.add(url)
-
+        value = normalize(raw, base)
+        if safe_url(value):
+            candidates.append(value)
     soup = BeautifulSoup(cleaned, "html.parser")
-    for tag in soup.find_all(["video", "source", "iframe"]):
-        for attribute in ("src", "data-src", "data-video", "data-file", "data-url", "data-m3u8"):
-            url = normalize(tag.get(attribute), base)
-            if url and safe_media_url(url):
-                candidates.add(url)
-
-    for key in ("file", "src", "source", "hls", "playlist", "url"):
+    for tag in soup.find_all(["iframe", "video", "source", "embed"]):
+        for attr in ("src", "data-src", "data-url", "data-video", "data-file", "data-m3u8", "href"):
+            value = normalize(tag.get(attr), base)
+            if safe_url(value):
+                candidates.append(value)
+    for key in ("file", "src", "source", "hls", "playlist", "url", "video_url"):
         for match in re.finditer(rf"[\"']{key}[\"']\s*:\s*[\"']([^\"']+)", cleaned, re.I):
-            url = normalize(match.group(1), base)
-            if url and (is_playlist(url) or ".mp4" in url.lower() or ".m3u8" in url.lower()) and safe_media_url(url):
-                candidates.add(url)
-
-    return list(candidates)
+            value = normalize(match.group(1), base)
+            if safe_url(value) and (is_playlist(value) or re.search(r"\.(?:mp4|m4v)(?:$|\?)", value, re.I)):
+                candidates.append(value)
+    return dedupe([{"url": x} for x in candidates]) and [x["url"] for x in dedupe([{"url": x} for x in candidates])]
 
 
 async def get_text(client: httpx.AsyncClient, url: str, headers: dict | None = None) -> tuple[str, str]:
     last: Exception | None = None
     for attempt in range(MAX_HTTP_RETRIES):
         try:
-            response = await client.get(url, headers=headers, timeout=15.0)
+            response = await client.get(url, headers=headers, timeout=16.0)
             response.raise_for_status()
             return response.text, str(response.url)
         except httpx.HTTPError as exc:
             last = exc
             if attempt < MAX_HTTP_RETRIES - 1:
-                await asyncio.sleep(0.25 * (attempt + 1))
+                await asyncio.sleep(0.3 * (attempt + 1))
     raise last or RuntimeError("request failed")
 
 
 async def streams_from_url(client: httpx.AsyncClient, url: str, referer: str, request: Request) -> list[dict]:
     try:
-        html, final_url = await get_text(client, url, {**SITE_HEADERS, "Referer": referer})
+        source, final = await get_text(client, url, {**SITE_HEADERS, "Referer": referer})
     except Exception as exc:
         logger.info("Could not inspect %s: %s", url, exc)
         return []
-
-    result = []
-    for media in extract_media(html, final_url):
-        if not safe_media_url(media):
-            continue
-        result.append(
-            {
-                "name": "DesiRulez",
-                "title": "HLS Stream" if is_playlist(media) else "MP4 Stream",
-                "url": proxy_link(request, media),
-                "behaviorHints": {"bingeGroup": "desirulez", "notWebReady": False},
-            }
-        )
-    return dedupe_preserve_order(result)
+    streams = []
+    for media in extract_media(source, final):
+        streams.append({"name": "DesiSerials", "title": "HLS Stream" if is_playlist(media) else "MP4 Stream",
+                        "url": proxy_link(request, media),
+                        "behaviorHints": {"bingeGroup": "desiserials", "notWebReady": False}})
+    return dedupe(streams)
 
 
 # -----------------------------------------------------------------------------
-# Proxy endpoints
+# Media proxy (HLS playlists rewrite both segment lines and URI attributes)
 # -----------------------------------------------------------------------------
 @app.get("/proxy")
 async def proxy_media(url: str, request: Request, range_header: str | None = Header(None, alias="Range")):
     target = decode_url(url)
-    if not safe_media_url(target):
+    if not safe_url(target):
         raise HTTPException(403, "Media host is not allowed")
-
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Referer": TARGET_SITE + "/",
-        "Origin": TARGET_SITE,
-        "Accept": "*/*",
-    }
+    headers = {"User-Agent": USER_AGENT, "Referer": TARGET_SITE + "/", "Origin": TARGET_SITE, "Accept": "*/*"}
     if range_header:
         headers["Range"] = range_header
-
-    client: httpx.AsyncClient = request.app.state.http
+    client = request.app.state.http
     try:
         response = await client.send(client.build_request("GET", target, headers=headers), stream=True)
-        if not safe_media_url(str(response.url)) or response.status_code >= 400:
+        if not safe_url(str(response.url)) or response.status_code >= 400:
             status = response.status_code if response.status_code >= 400 else 403
             await response.aclose()
             raise HTTPException(status, "Upstream media request failed")
-
-        passthrough = {
-            key: response.headers[key]
-            for key in (
-                "content-type",
-                "content-length",
-                "content-range",
-                "accept-ranges",
-                "cache-control",
-                "etag",
-            )
-            if key in response.headers
-        }
+        passthrough = {key: response.headers[key] for key in
+                       ("content-type", "content-length", "content-range", "accept-ranges", "cache-control", "etag")
+                       if key in response.headers}
         passthrough.update({"Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "*"})
-
         async def body():
             try:
-                async for chunk in response.aiter_bytes(1024 * 256):
+                async for chunk in response.aiter_bytes(262144):
                     yield chunk
             finally:
                 await response.aclose()
-
         return StreamingResponse(body(), status_code=response.status_code, headers=passthrough)
     except HTTPException:
         raise
     except httpx.HTTPError as exc:
-        logger.warning("Proxy failed: %s", exc)
         raise HTTPException(502, "Upstream media connection failed") from exc
 
 
 @app.get("/proxy/hls")
 async def proxy_hls(url: str, request: Request):
     playlist = decode_url(url)
-    if not safe_media_url(playlist):
+    if not safe_url(playlist):
         raise HTTPException(403, "Playlist host is not allowed")
-
-    client: httpx.AsyncClient = request.app.state.http
     try:
-        response = await client.get(
-            playlist,
-            headers={**SITE_HEADERS, "Accept": "application/vnd.apple.mpegurl,*/*"},
-            timeout=15.0,
-        )
+        response = await request.app.state.http.get(playlist, headers={**SITE_HEADERS, "Accept": "application/vnd.apple.mpegurl,*/*"}, timeout=16.0)
         response.raise_for_status()
-        final_url = str(response.url)
-        if not safe_media_url(final_url):
+        final = str(response.url)
+        if not safe_url(final):
             raise HTTPException(403, "Redirected playlist host is not allowed")
-
-        def rewrite_hls_uri(line: str) -> str:
+        def rewrite(line: str) -> str:
             def replace(match):
-                quote = match.group(1)
-                value = match.group(2)
-                target = normalize(value, final_url)
-                if not target or not safe_media_url(target):
-                    return match.group(0)
-                proxied = proxy_link(request, target)
-                return f"URI={quote}{proxied}{quote}"
-
-            return re.sub(r'URI\s*=\s*(["\'])(.*?)\1', replace, line, flags=re.I)
-
-        output: list[str] = []
-        for original in response.text.splitlines():
-            line = original.strip()
-            if not line:
-                output.append("")
-                continue
+                target = normalize(match.group(2), final)
+                return (f"URI={match.group(1)}{proxy_link(request, target)}{match.group(1)}"
+                        if target and safe_url(target) else match.group(0))
+            return re.sub(r"URI\s*=\s*([\"'])(.*?)\1", replace, line, flags=re.I)
+        output = []
+        for raw in response.text.splitlines():
+            line = raw.strip()
             if line.startswith("#"):
-                output.append(rewrite_hls_uri(line))
-                continue
-            target = normalize(line, final_url)
-            output.append(proxy_link(request, target) if target and safe_media_url(target) else original)
-
-        return Response(
-            "\n".join(output) + "\n",
-            media_type="application/vnd.apple.mpegurl",
-            headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
-        )
+                output.append(rewrite(line))
+            elif line:
+                target = normalize(line, final)
+                output.append(proxy_link(request, target) if target and safe_url(target) else raw)
+            else:
+                output.append("")
+        return Response("\n".join(output) + "\n", media_type="application/vnd.apple.mpegurl",
+                        headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"})
     except HTTPException:
         raise
     except httpx.HTTPError as exc:
@@ -503,16 +443,16 @@ async def proxy_hls(url: str, request: Request):
 
 
 # -----------------------------------------------------------------------------
-# Stremio routes
+# Stremio API
 # -----------------------------------------------------------------------------
 @app.get("/")
 def home():
-    return {"status": "DesiRulez addon active", "manifest": "/manifest.json"}
+    return {"status": "DesiSerials addon active", "target": TARGET_SITE, "manifest": "/manifest.json"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": MANIFEST["version"]}
+    return {"status": "ok", "version": MANIFEST["version"], "target": TARGET_SITE}
 
 
 @app.get("/manifest.json")
@@ -524,131 +464,74 @@ def manifest():
 @app.get("/catalog/tv/{catalog_id}/search={query}.json")
 async def catalog(catalog_id: str, request: Request, query: str | None = None):
     query = (query or "").strip()
-    key = f"catalog:{catalog_id}:{query.lower()}"
-    if cached := cache_get(key):
+    cache_key = f"catalog:{catalog_id}:{query.lower()}"
+    if cached := cache_get(cache_key):
         return cached
-
-    if catalog_id == "desirulez_popular" and not query:
-        payload = {
-            "metas": [
-                {
-                    "id": page_id(x["url"], "dr_cat_"),
-                    "type": "tv",
-                    "name": x["name"],
-                    "poster": x["poster"],
-                    "description": f"Episodes for {x['name']}",
-                }
-                for x in POPULAR_SERIALS
-            ]
-        }
-        cache_set(key, payload, 900)
-        return payload
-
-    if catalog_id == "desirulez_latest":
-        target = f"{TARGET_SITE}/"
-        try:
-            html, final = await get_text(request.app.state.http, target)
-            items = episode_links(html, final)
-        except Exception as exc:
-            logger.warning("Latest catalog failed: %s", exc)
-            items = []
-        payload = {
-            "metas": [
-                {
-                    "id": page_id(x["url"]),
-                    "type": "tv",
-                    "name": x["title"],
-                    "poster": x["poster"],
-                    "description": x["title"],
-                }
-                for x in items[:MAX_CATALOG_ITEMS]
-            ]
-        }
-        cache_set(key, payload, 300)
-        return payload
-
-    target = f"{TARGET_SITE}/?s={query.replace(' ', '+')}" if query else TARGET_SITE
+    client = request.app.state.http
+    items: list[dict[str, str]] = []
     try:
-        html, final = await get_text(request.app.state.http, target)
-        items = episode_links(html, final)
+        if catalog_id == "desiserials_latest":
+            source, final = await get_text(client, TARGET_SITE)
+            items = episode_links(source, final)
+        elif catalog_id == "desiserials_shows":
+            target = f"{TARGET_SITE}/?s={quote_plus(query)}" if query else TARGET_SITE
+            source, final = await get_text(client, target)
+            items = show_links(source, final)
+            # Some themes expose only posts on the home page. Present them as
+            # searchable TV entries rather than returning an empty catalog.
+            if not items:
+                items = episode_links(source, final)
+        else:
+            return {"metas": []}
     except Exception as exc:
-        logger.warning("Catalog failed: %s", exc)
-        items = []
-
-    payload = {
-        "metas": [
-            {
-                "id": page_id(x["url"]),
-                "type": "tv",
-                "name": x["title"],
-                "poster": x["poster"],
-                "description": x["title"],
-            }
-            for x in items[:MAX_CATALOG_ITEMS]
-        ]
-    }
-    cache_set(key, payload, 300)
+        logger.warning("Catalog %s failed: %s", catalog_id, exc)
+    metas = []
+    for item in items[:MAX_CATALOG_ITEMS]:
+        is_episode = catalog_id == "desiserials_latest" or is_episode_url(item["url"], item["title"])
+        metas.append({"id": page_id(item["url"]) if is_episode else page_id(item["url"], "dr_show_"),
+                      "type": "tv", "name": item["title"], "poster": item["poster"],
+                      "description": item["title"]})
+    payload = {"metas": metas}
+    cache_set(cache_key, payload, 300)
     return payload
 
 
 @app.get("/meta/tv/{id}.json")
 async def meta(id: str, request: Request):
-    key = "meta:" + id
-    if cached := cache_get(key):
+    if cached := cache_get("meta:" + id):
         return cached
-
     client = request.app.state.http
-
-    if id.startswith("dr_cat_"):
-        category = id_url(id, "dr_cat_")
-        show = next((x for x in POPULAR_SERIALS if x["url"] == category), None)
+    if id.startswith("dr_show_"):
+        page = id_url(id, "dr_show_")
         try:
-            html, final = await get_text(client, category)
-            links = episode_links(html, final)
+            source, final = await get_text(client, page)
+            soup = BeautifulSoup(source, "html.parser")
+            name = title_from_page(soup, "Indian Serial")
+            links = episode_links(source, final)
+            poster = (soup.select_one("meta[property='og:image']") or {}).get("content", DEFAULT_POSTER)
         except Exception:
-            links = []
-
+            name, links, poster = "Indian Serial", [], DEFAULT_POSTER
         videos = []
-        for number, item in enumerate(links[:100], 1):
+        for number, item in enumerate(links[:MAX_VIDEOS], 1):
             video = {"id": page_id(item["url"]), "title": item["title"], "season": 1, "episode": number}
             if released := date_from_title(item["title"]):
                 video["released"] = released
             videos.append(video)
-
-        result = {
-            "meta": {
-                "id": id,
-                "type": "tv",
-                "name": show["name"] if show else "Indian Serial",
-                "poster": show["poster"] if show else DEFAULT_POSTER,
-                "videos": videos,
-            }
-        }
+        result = {"meta": {"id": id, "type": "tv", "name": name, "poster": poster, "videos": videos}}
     elif id.startswith("dr_ep_"):
-        episode = id_url(id, "dr_ep_")
+        page = id_url(id, "dr_ep_")
         try:
-            html, _ = await get_text(client, episode)
-            title = title_from_page(BeautifulSoup(html, "html.parser"))
+            source, _ = await get_text(client, page)
+            title = title_from_page(BeautifulSoup(source, "html.parser"))
         except Exception:
             title = "Serial Episode"
-
         video = {"id": id, "title": title, "season": 1, "episode": 1}
         if released := date_from_title(title):
             video["released"] = released
-
-        result = {
-            "meta": {
-                "id": id,
-                "type": "tv",
-                "name": title,
-                "poster": DEFAULT_POSTER,
-                "videos": [video],
-            }
-        }
+        result = {"meta": {"id": id, "type": "tv", "name": title, "poster": DEFAULT_POSTER, "videos": [video]}}
     else:
         result = {"meta": {"id": id, "type": "tv", "name": "Unknown"}}
-
-    cache_set(key, result, 300)
+    cache_set("meta:" + id, result, 300)
     return result
 
 
@@ -656,41 +539,34 @@ async def meta(id: str, request: Request):
 async def stream(id: str, request: Request):
     if not id.startswith("dr_ep_"):
         return {"streams": []}
-
-    key = "stream:" + id
-    if cached := cache_get(key):
+    if cached := cache_get("stream:" + id):
         return cached
-
-    page = id_url(id, "dr_ep_")
-    client = request.app.state.http
+    page, client = id_url(id, "dr_ep_"), request.app.state.http
     found: list[dict] = []
-
     try:
-        html, final = await get_text(client, page)
-        soup = BeautifulSoup(html, "html.parser")
+        source, final = await get_text(client, page)
+        soup = BeautifulSoup(source, "html.parser")
         candidates = [final]
-        for iframe in soup.select("iframe[src], video[src], source[src]"):
-            candidate = normalize(iframe.get("src"), final)
-            if candidate and candidate not in candidates:
-                candidates.append(candidate)
-
+        for tag in soup.select("iframe[src], iframe[data-src], video[src], source[src], embed[src]"):
+            for attr in ("src", "data-src"):
+                candidate = normalize(tag.get(attr), final)
+                if candidate and safe_url(candidate) and candidate not in candidates:
+                    candidates.append(candidate)
+        # Also inspect media/iframe URLs hidden in inline JavaScript.
+        candidates.extend(x for x in extract_media(source, final) if x not in candidates)
         sem = asyncio.Semaphore(STREAM_CONCURRENCY)
-
         async def inspect(candidate: str):
             async with sem:
                 return await streams_from_url(client, candidate, page, request)
-
         batches = await asyncio.gather(*(inspect(x) for x in candidates[:STREAM_CANDIDATES_LIMIT]), return_exceptions=True)
         for batch in batches:
             if isinstance(batch, list):
                 found.extend(batch)
     except Exception as exc:
         logger.warning("Stream extraction failed for %s: %s", page, exc)
-
-    unique = dedupe_preserve_order(found)
-    result = {"streams": unique[:MAX_STREAMS_PER_REQUEST]}
-    if unique:
-        cache_set(key, result, 120)
+    result = {"streams": dedupe(found)[:MAX_STREAMS_PER_REQUEST]}
+    if result["streams"]:
+        cache_set("stream:" + id, result, 120)
     return result
 
 
