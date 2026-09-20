@@ -32,6 +32,9 @@ DEFAULT_POSTER = os.getenv(
 MAX_URL_LENGTH = 2048
 MAX_CATALOG_ITEMS = 60
 MAX_STREAMS_PER_REQUEST = 30
+MAX_HTTP_RETRIES = 3
+STREAM_CANDIDATES_LIMIT = 12
+STREAM_CONCURRENCY = 6
 
 ALLOWED_MEDIA_HOSTS = {
     "desiruleztv.net",
@@ -83,9 +86,9 @@ SITE_HEADERS = {
 
 MANIFEST = {
     "id": "org.desiruleztv.production.addon",
-    "version": "5.0.1",
+    "version": "5.1.0",
     "name": "DesiRulez TV",
-    "description": "Indian TV catalog with resilient extraction and HLS/HTTP proxying.",
+    "description": "Indian TV catalog with resilient extraction and safe HLS/HTTP proxying.",
     "logo": DEFAULT_POSTER,
     "resources": ["catalog", "meta", "stream"],
     "types": ["tv"],
@@ -121,6 +124,18 @@ def cache_get(key: str) -> Any | None:
 
 def cache_set(key: str, value: Any, ttl: int) -> None:
     CACHE[key] = (time.monotonic() + ttl, value)
+
+
+def dedupe_preserve_order(items: list[dict]) -> list[dict]:
+    unique, seen = [], set()
+    for item in items:
+        key = item.get("url") or item.get("id")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        unique.append(item)
+    return unique
 
 
 @asynccontextmanager
@@ -162,7 +177,7 @@ def decode_url(value: str) -> str:
 
 def host_allowed(url: str) -> bool:
     try:
-        if len(url) > MAX_URL_LENGTH:
+        if not url or len(url) > MAX_URL_LENGTH:
             return False
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower().rstrip(".")
@@ -201,7 +216,8 @@ def normalize(raw: str | None, base: str) -> str | None:
     value = unquote(value)
     if value.startswith("//"):
         value = "https:" + value
-    return urljoin(base, value)
+    normalized = urljoin(base, value)
+    return normalized if normalized else None
 
 
 def is_playlist(url: str) -> bool:
@@ -217,6 +233,8 @@ def public_base(request: Request) -> str:
 
 
 def proxy_link(request: Request, target: str) -> str:
+    if not target:
+        return ""
     encoded = encode_url(target)
     if is_playlist(target):
         return f"{public_base(request)}proxy/hls?url={encoded}"
@@ -243,8 +261,9 @@ def text_of(tag) -> str:
 def title_from_page(soup: BeautifulSoup, fallback: str = "Serial Episode") -> str:
     for selector in ("h1", "article h1", ".entry-title", ".post-title", "title"):
         tag = soup.select_one(selector)
-        if text_of(tag):
-            return text_of(tag)
+        value = text_of(tag)
+        if value:
+            return value
     return fallback
 
 
@@ -317,34 +336,38 @@ def extract_media(html: str, base: str) -> list[str]:
         .replace("\\u003d", "=")
     )
     candidates: set[str] = set()
+
     for raw in MEDIA_RE.findall(cleaned):
         url = normalize(raw, base)
         if url and safe_media_url(url):
             candidates.add(url)
+
     soup = BeautifulSoup(cleaned, "html.parser")
-    for tag in soup.find_all(["video", "source"]):
-        for attribute in ("src", "data-src", "data-video", "data-file", "data-url"):
+    for tag in soup.find_all(["video", "source", "iframe"]):
+        for attribute in ("src", "data-src", "data-video", "data-file", "data-url", "data-m3u8"):
             url = normalize(tag.get(attribute), base)
             if url and safe_media_url(url):
                 candidates.add(url)
-    for key in ("file", "src", "source", "hls", "playlist"):
+
+    for key in ("file", "src", "source", "hls", "playlist", "url"):
         for match in re.finditer(rf"[\"']{key}[\"']\s*:\s*[\"']([^\"']+)", cleaned, re.I):
             url = normalize(match.group(1), base)
-            if url and (is_playlist(url) or ".mp4" in url.lower()) and safe_media_url(url):
+            if url and (is_playlist(url) or ".mp4" in url.lower() or ".m3u8" in url.lower()) and safe_media_url(url):
                 candidates.add(url)
+
     return list(candidates)
 
 
 async def get_text(client: httpx.AsyncClient, url: str, headers: dict | None = None) -> tuple[str, str]:
     last: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(MAX_HTTP_RETRIES):
         try:
             response = await client.get(url, headers=headers, timeout=15.0)
             response.raise_for_status()
             return response.text, str(response.url)
         except httpx.HTTPError as exc:
             last = exc
-            if attempt < 2:
+            if attempt < MAX_HTTP_RETRIES - 1:
                 await asyncio.sleep(0.25 * (attempt + 1))
     raise last or RuntimeError("request failed")
 
@@ -355,8 +378,11 @@ async def streams_from_url(client: httpx.AsyncClient, url: str, referer: str, re
     except Exception as exc:
         logger.info("Could not inspect %s: %s", url, exc)
         return []
+
     result = []
     for media in extract_media(html, final_url):
+        if not safe_media_url(media):
+            continue
         result.append(
             {
                 "name": "DesiRulez",
@@ -365,7 +391,7 @@ async def streams_from_url(client: httpx.AsyncClient, url: str, referer: str, re
                 "behaviorHints": {"bingeGroup": "desirulez", "notWebReady": False},
             }
         )
-    return result
+    return dedupe_preserve_order(result)
 
 
 # -----------------------------------------------------------------------------
@@ -464,6 +490,7 @@ async def proxy_hls(url: str, request: Request):
                 continue
             target = normalize(line, final_url)
             output.append(proxy_link(request, target) if target and safe_media_url(target) else original)
+
         return Response(
             "\n".join(output) + "\n",
             media_type="application/vnd.apple.mpegurl",
@@ -647,25 +674,20 @@ async def stream(id: str, request: Request):
             if candidate and candidate not in candidates:
                 candidates.append(candidate)
 
-        sem = asyncio.Semaphore(6)
+        sem = asyncio.Semaphore(STREAM_CONCURRENCY)
 
         async def inspect(candidate: str):
             async with sem:
                 return await streams_from_url(client, candidate, page, request)
 
-        batches = await asyncio.gather(*(inspect(x) for x in candidates[:12]), return_exceptions=True)
+        batches = await asyncio.gather(*(inspect(x) for x in candidates[:STREAM_CANDIDATES_LIMIT]), return_exceptions=True)
         for batch in batches:
             if isinstance(batch, list):
                 found.extend(batch)
     except Exception as exc:
         logger.warning("Stream extraction failed for %s: %s", page, exc)
 
-    unique, seen = [], set()
-    for item in found:
-        if item["url"] not in seen:
-            seen.add(item["url"])
-            unique.append(item)
-
+    unique = dedupe_preserve_order(found)
     result = {"streams": unique[:MAX_STREAMS_PER_REQUEST]}
     if unique:
         cache_set(key, result, 120)
