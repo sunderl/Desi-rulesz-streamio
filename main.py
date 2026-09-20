@@ -1,9 +1,10 @@
+import os
 import base64
 import re
 from urllib.parse import urljoin
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 import httpx
 from bs4 import BeautifulSoup
 
@@ -29,9 +30,9 @@ POPULAR_SERIALS = [
 
 MANIFEST = {
     "id": "org.desiruleztv.proxy.addon",
-    "version": "3.1.0",
-    "name": "DesiRulez TV (No-VPN Stream)",
-    "description": "Watch All Indian Serials Online without VPN using Proxy Stream Bypass",
+    "version": "3.2.0",
+    "name": "DesiRulez TV (HLS & Range Fixed)",
+    "description": "Watch Indian Serials without VPN with proper HLS segment proxying and MP4 seeking support",
     "resources": ["catalog", "meta", "stream"],
     "types": ["tv"],
     "catalogs": [
@@ -56,17 +57,20 @@ HEADERS = {
     "Referer": TARGET_SITE
 }
 
+def get_base_url(request: Request) -> str:
+    env_url = os.getenv("PUBLIC_BASE_URL")
+    if env_url:
+        return env_url.rstrip("/") + "/"
+    return str(request.base_url)
+
 def encode_url(url: str) -> str:
-    """Safely encode full URL into base64 string"""
     return base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
 
 def decode_url(encoded_str: str) -> str:
-    """Safely decode base64 string back to full original URL"""
     padding = "=" * (-len(encoded_str) % 4)
     return base64.urlsafe_b64decode(encoded_str + padding).decode()
 
 def parse_date_from_title(title: str) -> str:
-    """Extract date from title like '15th March 2026' -> YYYY-MM-DD"""
     months = {
         "january": "01", "february": "02", "march": "03", "april": "04",
         "may": "05", "june": "06", "july": "07", "august": "08",
@@ -81,26 +85,119 @@ def parse_date_from_title(title: str) -> str:
         return f"{year}-{month}-{int(day):02d}"
     return None
 
-# 🚀 PROXY ROUTE: BINa VPN KE STREAM CHALANE KE LIYE
+# 1. RANGE-AWARE MEDIA PROXY (FOR MP4, TS SEGMENTS, KEYS)
 @app.get("/proxy")
-async def proxy_stream(url: str):
+async def proxy_stream(
+    url: str,
+    range_header: str | None = Header(default=None, alias="Range"),
+):
     try:
         target_url = decode_url(url)
-        client = httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30.0)
-        req = client.build_request("GET", target_url)
-        res = await client.send(req, stream=True)
 
-        return StreamingResponse(
-            res.aiter_raw(),
-            status_code=res.status_code,
-            headers={
-                "Content-Type": res.headers.get("content-type", "video/mp4"),
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "*"
-            }
+        if not target_url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="Invalid media URL")
+
+        req_headers = {
+            "User-Agent": HEADERS["User-Agent"],
+            "Referer": TARGET_SITE,
+        }
+
+        if range_header:
+            req_headers["Range"] = range_header
+
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        ) as client:
+            response = await client.get(target_url, headers=req_headers)
+
+        res_headers = {}
+        for h in (
+            "content-type",
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "cache-control",
+            "etag",
+            "last-modified",
+        ):
+            if h in response.headers:
+                res_headers[h] = response.headers[h]
+
+        res_headers["Access-Control-Allow-Origin"] = "*"
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=res_headers,
+            media_type=response.headers.get("content-type"),
         )
-    except Exception as e:
-        return {"error": f"Proxy bypass failed: {str(e)}"}
+
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+# 2. HLS PLAYLIST REWRITER PROXY (.m3u8)
+@app.get("/proxy/hls")
+async def proxy_hls(url: str, request: Request):
+    try:
+        playlist_url = decode_url(url)
+
+        async with httpx.AsyncClient(
+            headers=HEADERS,
+            follow_redirects=True,
+            timeout=httpx.Timeout(15.0, connect=8.0),
+        ) as client:
+            response = await client.get(playlist_url)
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail="Unable to load HLS playlist",
+            )
+
+        public_base = get_base_url(request).rstrip("/")
+        output_lines = []
+
+        for line in response.text.splitlines():
+            line_str = line.strip()
+
+            if not line_str:
+                output_lines.append("")
+                continue
+
+            if line_str.startswith("#"):
+                # Handle AES-128 Encryption Key or Map URI rewriting
+                if "URI=" in line_str:
+                    def replace_uri(match):
+                        raw_uri = match.group(1)
+                        full_key_url = urljoin(str(response.url), raw_uri)
+                        encoded_key = encode_url(full_key_url)
+                        return f'URI="{public_base}/proxy?url={encoded_key}"'
+                    
+                    line_str = re.sub(r'URI="([^"]+)"', replace_uri, line_str)
+                output_lines.append(line_str)
+                continue
+
+            # Segment or Sub-playlist URL rewriting
+            segment_url = urljoin(str(response.url), line_str)
+            encoded_segment = encode_url(segment_url)
+
+            if ".m3u8" in line_str.lower() or "m3u8" in segment_url.lower():
+                output_lines.append(f"{public_base}/proxy/hls?url={encoded_segment}")
+            else:
+                output_lines.append(f"{public_base}/proxy?url={encoded_segment}")
+
+        return Response(
+            content="\n".join(output_lines),
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 @app.get("/")
 def home():
@@ -273,52 +370,46 @@ async def meta(id: str):
 
     return {"meta": {"id": id, "type": "tv", "name": "Unknown"}}
 
-# DEEP STREAM EXTRACTION WITH PROXY CONVERSION
+# DEEP MEDIA EXTRACTION
 async def extract_direct_media(embed_url: str, client: httpx.AsyncClient, base_url: str) -> list:
     found_streams = []
     try:
         res = await client.get(embed_url, timeout=8.0)
         html = res.text
 
-        # 1. Direct .m3u8 URLs
+        # 1. Direct .m3u8 URLs -> Route via HLS Proxy
         m3u8_links = re.findall(r'["\'](https?://[^"\']+\.m3u8[^"\']*)["\']', html)
         for link in m3u8_links:
             clean_link = link.replace("\\/", "/")
-            proxy_link = f"{base_url}proxy?url={encode_url(clean_link)}"
+            proxy_link = f"{base_url}proxy/hls?url={encode_url(clean_link)}"
             if proxy_link not in [s["url"] for s in found_streams]:
                 found_streams.append({
-                    "name": "⚡ No-VPN Proxy [Fast]",
-                    "title": "Bypass ISP Block (No VPN Required)",
+                    "name": "⚡ No-VPN HLS Proxy",
+                    "title": "Proxied Direct HLS Stream (.m3u8)",
                     "url": proxy_link
                 })
-                # Direct option backup
-                found_streams.append({
-                    "name": "Direct Stream [HLS]",
-                    "title": "Direct Stream (.m3u8)",
-                    "url": clean_link
-                })
 
-        # 2. Direct .mp4 URLs
+        # 2. Direct .mp4 URLs -> Route via Range Proxy
         mp4_links = re.findall(r'["\'](https?://[^"\']+\.mp4[^"\']*)["\']', html)
         for link in mp4_links:
             clean_link = link.replace("\\/", "/")
             proxy_link = f"{base_url}proxy?url={encode_url(clean_link)}"
             if proxy_link not in [s["url"] for s in found_streams]:
                 found_streams.append({
-                    "name": "⚡ No-VPN Proxy [MP4]",
-                    "title": "Bypass ISP Block (Direct MP4)",
+                    "name": "⚡ No-VPN MP4 Proxy",
+                    "title": "Proxied Direct MP4 Stream",
                     "url": proxy_link
                 })
 
-        # 3. VK Stream quality parameters
+        # 3. VK Stream Links -> Route via Range Proxy
         vk_urls = re.findall(r'"url(?:720|1080|480|360)"\s*:\s*"([^"]+)"', html)
         for v_url in vk_urls:
             clean_link = v_url.replace("\\/", "/")
             proxy_link = f"{base_url}proxy?url={encode_url(clean_link)}"
             if proxy_link not in [s["url"] for s in found_streams]:
                 found_streams.append({
-                    "name": "⚡ No-VPN Proxy [VK Server]",
-                    "title": "Bypass ISP Block (VK Stream 720p)",
+                    "name": "⚡ No-VPN VK Proxy",
+                    "title": "Proxied VK HD Stream (720p)",
                     "url": proxy_link
                 })
 
@@ -341,14 +432,14 @@ async def stream(id: str, request: Request):
         print(f"URL Decode error: {e}")
         return {"streams": []}
 
-    base_server_url = str(request.base_url)
+    base_server_url = get_base_url(request)
 
     try:
         async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=12.0) as client:
             res = await client.get(page_url)
             soup = BeautifulSoup(res.text, "html.parser")
 
-            # 1. Search IFrames
+            # Search IFrames
             iframes = soup.find_all("iframe", src=True)
             for iframe in iframes:
                 src = urljoin(page_url, iframe["src"].strip())
@@ -357,15 +448,7 @@ async def stream(id: str, request: Request):
                     direct_streams = await extract_direct_media(src, client, base_server_url)
                     streams.extend(direct_streams)
 
-                    # Embed Proxy Option
-                    proxy_embed = f"{base_server_url}proxy?url={encode_url(src)}"
-                    streams.append({
-                        "name": "⚡ No-VPN Embed Stream",
-                        "title": f"Bypass ISP ({src.split('/')[2]})",
-                        "url": proxy_embed
-                    })
-
-            # 2. Search Page Scripts
+            # Search Page Scripts
             page_direct_streams = await extract_direct_media(page_url, client, base_server_url)
             for ds in page_direct_streams:
                 if ds["url"] not in [s["url"] for s in streams]:
