@@ -139,7 +139,11 @@ def is_episode_url(url: str, title: str = "") -> bool:
 
 def is_channel_title(title: str) -> bool:
     value = re.sub(r"[^a-z0-9&]+", " ", clean_title(title).lower()).strip()
-    return value in CHANNEL_LABELS or value.replace("&", "and") in {x.replace("&", "and") for x in CHANNEL_LABELS}
+    if value in CHANNEL_LABELS or value.replace("&", "and") in {x.replace("&", "and") for x in CHANNEL_LABELS}:
+        return True
+    if any(token in value for token in ("zee tv", "zee-tv", "z tv", "zeetv")):
+        return True
+    return False
 
 
 def is_navigation(url: str, title: str) -> bool:
@@ -150,17 +154,23 @@ def is_navigation(url: str, title: str) -> bool:
 def show_title(raw: str) -> str:
     """Convert a post title into the series name used for grouping."""
     title = clean_title(raw)
+    title = title.replace("Watch Online", "").replace("watch online", "")
     title = re.sub(r"\s*\|.*$", "", title)
-    title = re.sub(r"\s+-\s+(?:bigg?\s*boss|full episode|watch.*)$", "", title, flags=re.I)
+    title = re.sub(r"\s*[-–]\s*(?:Zee TV|Star Plus|Colors TV|Sony TV|SAB TV|And TV|Dangal TV).*$", "", title, flags=re.I)
+    title = re.sub(r"^(?:Zee TV|Star Plus|Colors TV|Sony TV|SAB TV|And TV|Dangal TV)\s*[:\-|–]?\s*", "", title, flags=re.I)
+    title = re.sub(r"\s*[:\-|–]?\s*(?:Watch|Watch Online|Serials|Serial)\s*$", "", title, flags=re.I)
+    title = re.sub(r"\s*[-–]\s*(?:full episode|watch.*|episode.*)$", "", title, flags=re.I)
     title = re.sub(r"\b(?:full\s+)?episode\b.*$", "", title, flags=re.I)
     title = re.sub(r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+)?(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+20\d{2}.*$", "", title, flags=re.I)
     title = re.sub(r"\b20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}.*$", "", title, flags=re.I)
+    title = re.sub(r"\s+", " ", title).strip(" -|:")
     return clean_title(title)
 
 
 def title_like_show(title: str) -> bool:
     value = show_title(title)
-    return bool(value and not is_channel_title(value) and value.lower() not in NAV_LABELS and len(value) >= 3 and re.search(r"[a-zA-Z]", value))
+    if not value or is_channel_title(value) or value.lower() in NAV_LABELS: return False
+    return len(value) >= 3 and bool(re.search(r"[a-zA-Z]", value))
 
 
 def poster_for(anchor, base: str) -> str:
@@ -177,14 +187,16 @@ def episode_items(source: str, base: str) -> list[dict[str, str]]:
     soup = BeautifulSoup(source, "html.parser"); result = []
     containers = soup.select("article, .post, .post-item, .item, .card, .serial, .show, .movie, .grid-item, .entry") or [soup]
     for container in containers:
-        for anchor in container.select("a[href]")[:5]:
+        for anchor in container.select("a[href]")[:8]:
             url = normalize(anchor.get("href"), base)
             raw = text_of(container.select_one("h1, h2, h3, h4, .entry-title, .post-title, .title, .name") or anchor)
             title = clean_title(raw)
-            if url and same_site(url) and not is_navigation(url, title) and is_episode_url(url, title):
-                name = show_title(title)
-                if title_like_show(name):
-                    result.append({"url": url.split("#")[0], "title": title, "show": name, "poster": poster_for(anchor, base)})
+            if not url or not same_site(url) or not title or len(title) < 5: continue
+            if is_navigation(url, title): continue
+            if not is_episode_url(url, title): continue
+            cleaned_name = show_title(title)
+            if not title_like_show(cleaned_name): continue
+            result.append({"url": url.split("#")[0], "title": title, "show": cleaned_name, "poster": poster_for(anchor, base)})
     return dedupe(result)
 
 
@@ -201,7 +213,7 @@ async def get_text(client: httpx.AsyncClient, url: str, headers: dict | None = N
 
 async def collect_pages(client: httpx.AsyncClient, base: str, query: str = "", slug: str | None = None) -> list[tuple[str, str]]:
     if slug:
-        urls = [f"{base}/category/{slug}/", f"{base}/{slug}/"]
+        urls = [f"{base}/category/{slug}/", f"{base}/{slug}/", f"{base}/category/{slug}/page/2/", f"{base}/category/{slug}/page/3/"]
     else:
         first = f"{base}/?s={quote_plus(query)}" if query else base
         urls = [first] + [f"{base}/page/{n}/" for n in range(2, 11)] + [f"{base}/{x}/" for x in ("all-serials", "category", "tv-show", "latest-episodes", "series")]
@@ -306,6 +318,8 @@ async def catalog(catalog_id: str, request: Request, query: str | None = None):
     if catalog_id not in {"desiserials_shows", "desiserials_latest"} and not channel: return {"metas": []}
     items = []
     for source, final in await collect_pages(request.app.state.http, TARGET_SITE, query, channel[1] if channel else None): items.extend(episode_items(source, final))
+    if "zee" in (catalog_id or "").lower() or (TARGET_SITE.endswith("watch.desitashan.ru") and "zee" in TARGET_SITE.lower()):
+        items = [item for item in items if not is_channel_title(item["show"])]
     groups = grouped(dedupe(items))
     metas = []
     for group in groups[:MAX_CATALOG_ITEMS]:
