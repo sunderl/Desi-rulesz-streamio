@@ -30,15 +30,12 @@ DEFAULT_POSTER = os.getenv(
 )
 USER_AGENT = os.getenv(
     "USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
 )
 MAX_URL_LENGTH = 4096
 MAX_CATALOG_ITEMS, MAX_VIDEOS = 100, 250
 MAX_STREAMS_PER_REQUEST, STREAM_CANDIDATES_LIMIT, STREAM_CONCURRENCY = 30, 40, 8
 
-# Only hosts that are expected to contain media are proxied. Additional hosts can
-# be supplied as a comma-separated MEDIA_HOSTS_EXTRA environment variable.
 MEDIA_HOSTS = {
     TARGET_HOST,
     "desiserials.ru",
@@ -65,7 +62,7 @@ SITE_HEADERS = {
 }
 MANIFEST = {
     "id": "org.desiserials.streamio",
-    "version": "7.0.0",
+    "version": "7.0.1",
     "name": "DesiSerials TV",
     "description": "Indian serials with search, gateway-player discovery and resilient HLS playback.",
     "logo": DEFAULT_POSTER,
@@ -218,8 +215,16 @@ def title_from_page(soup: BeautifulSoup, fallback: str = "Serial Episode") -> st
 
 
 def date_from_title(value: str) -> str | None:
-    months = {name: number for number, aliases in enumerate(("january jan", "february feb", "march mar", "april apr", "may", "june jun", "july jul", "august aug", "september sep", "october oct", "november nov", "december dec"), 1) for name in aliases.split()}
-    patterns = [r"\b(\d{1,2})[\s,.-]+([A-Za-z]{3,9})[\s,.-]+(20\d{2})\b", r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b"]
+    months = {
+        name: idx
+        for idx, names in enumerate(("january jan", "february feb", "march mar", "april apr", "may", "june jun", "july jul", "august aug", "september sep", "october oct", "november nov", "december dec"), start=1)
+        for name in names.split()
+    }
+    patterns = [
+        r"\b(\d{1,2})[\s,.-]+([A-Za-z]{3,9})[\s,.-]+(20\d{2})\b",
+        r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b",
+        r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b",
+    ]
     for index, pattern in enumerate(patterns):
         match = re.search(pattern, value, re.I)
         if not match:
@@ -253,7 +258,9 @@ def poster_for(anchor, base: str) -> str:
 
 def is_navigation(url: str, title: str) -> bool:
     path = urlparse(url).path.lower().rstrip("/")
-    return path in {"", "/category", "/contact", "/about", "/privacy-policy", "/dmca", "/all-serials"} or clean_title(title).lower() in {"home", "menu", "next", "previous", "read more", "login"}
+    title = clean_title(title).lower()
+    generic = {"home", "menu", "next", "previous", "read more", "login", "contact", "about", "privacy", "privacy-policy", "dmca", "all serials", "latest episodes", "watch now", "new videos", "more"}
+    return path in {"", "/category", "/contact", "/about", "/privacy-policy", "/dmca", "/all-serials"} or title in generic or title.startswith("read more") or title.startswith("watch ")
 
 
 def is_episode_url(url: str, title: str = "") -> bool:
@@ -261,21 +268,32 @@ def is_episode_url(url: str, title: str = "") -> bool:
     return bool(re.search(r"episode|watch|video|serial|\bep\.?\s*\d+|\b\d{1,4}(?:st|nd|rd|th)?[- .]?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|20\d{2})", value))
 
 
+def looks_like_serial_title(title: str) -> bool:
+    value = clean_title(title).lower()
+    if not value or len(value) < 3:
+        return False
+    if any(x in value for x in ("home", "menu", "next", "previous", "read more", "login", "contact", "privacy", "dmca", "watch now", "more")):
+        return False
+    return bool(re.search(r"[a-z]", value)) and len(value.split()) >= 2
+
+
 def links(source: str, base: str, episodes: bool) -> list[dict[str, str]]:
     soup, result = BeautifulSoup(source, "html.parser"), []
-    selectors = "a[href]" if episodes else "article a[href], .item a[href], .post a[href], .card a[href], .serial a[href], a[href]"
+    selectors = "article a[href], .entry a[href], .item a[href], .post a[href], .card a[href], .serial a[href], .title a[href], .movie a[href], a[href]"
     for anchor in soup.select(selectors):
         url = normalize(anchor.get("href"), base)
         title = clean_title(text_of(anchor) or anchor.get("title", ""))
-        if not url or not same_site(url) or not title or len(title) < 3 or is_navigation(url, title):
+        if not url or not same_site(url) or not title or not looks_like_serial_title(title) or is_navigation(url, title):
             continue
         episode = is_episode_url(url, title)
-        if episode == episodes and (episodes or urlparse(url).path.count("/") <= 3):
+        include = episode if episodes else (not episode or len(title.split()) >= 3)
+        if include and (episodes or urlparse(url).path.count("/") <= 5):
             result.append({"url": url.split("#")[0], "title": title, "poster": poster_for(anchor, base)})
     return dedupe(result)
 
 
 MEDIA_RE = re.compile(r"(?:https?:)?//[^\"'<>\\\s]+?(?:\.m3u8|\.mp4|\.m4v)(?:\?[^\"'<>\\\s]*)?", re.I)
+
 
 def extract_media(source: str, base: str) -> list[str]:
     cleaned = html_lib.unescape(source).replace("\\/", "/").replace("\\u0026", "&")
@@ -327,7 +345,6 @@ async def streams_from_url(client: httpx.AsyncClient, url: str, referer: str, re
     except Exception:
         return []
     media = extract_media(source, final)
-    # Some gateway pages only contain player buttons; traverse those one level.
     for gateway in gateway_links(source, final):
         try:
             gateway_source, gateway_final = await get_text(client, gateway, {**SITE_HEADERS, "Referer": url})
@@ -341,7 +358,6 @@ async def streams_from_url(client: httpx.AsyncClient, url: str, referer: str, re
         "url": proxy_link(request, item),
         "behaviorHints": {"bingeGroup": "desiserials", "notWebReady": False},
     } for item in dict.fromkeys(media)]
-    # An iframe can be a player rather than a page containing a visible URL.
     if not result and safe_url(url) and url != referer:
         result.append({"name": "DesiSerials", "title": f"{label + ' - ' if label else ''}Embedded Player", "url": url, "behaviorHints": {"bingeGroup": "desiserials", "notWebReady": True}})
     return dedupe(result)
@@ -363,12 +379,14 @@ async def proxy_media(url: str, request: Request, range_header: str | None = Hea
             raise HTTPException(status, "Upstream media request failed")
         passthrough = {k: response.headers[k] for k in ("content-type", "content-length", "content-range", "accept-ranges", "cache-control", "etag") if k in response.headers}
         passthrough.update({"Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "Content-Length,Content-Range,Accept-Ranges"})
+
         async def body():
             try:
                 async for chunk in response.aiter_bytes(262144):
                     yield chunk
             finally:
                 await response.aclose()
+
         return StreamingResponse(body(), status_code=response.status_code, headers=passthrough)
     except HTTPException:
         raise
@@ -408,9 +426,11 @@ async def proxy_hls(url: str, request: Request):
 def home():
     return {"status": "DesiSerials addon active", "target": TARGET_SITE, "manifest": "/manifest.json"}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": MANIFEST["version"], "target": TARGET_SITE}
+
 
 @app.get("/manifest.json")
 def manifest():
@@ -423,20 +443,35 @@ async def collect_pages(client: httpx.AsyncClient, base: str, query: str = "") -
         home_source, home_final = await get_text(client, first_url)
     except Exception:
         return []
+
     urls = [first_url] + [f"{base}/page/{n}/" for n in range(2, 6)]
-    # Discover channel/category pages instead of depending on one fixed slug.
+    home_urls = [
+        f"{base}/all-serials/",
+        f"{base}/category/",
+        f"{base}/tv-show/",
+        f"{base}/latest-episodes/",
+        f"{base}/series/",
+    ]
+    urls.extend(home_urls)
+
     soup = BeautifulSoup(home_source, "html.parser")
-    for anchor in soup.select("nav a[href], header a[href], .menu a[href], a[href]"):
+    for anchor in soup.select("nav a[href], header a[href], .menu a[href], .nav a[href], a[href]"):
         href = normalize(anchor.get("href"), home_final)
         label = clean_title(text_of(anchor))
-        if href and same_site(href) and label and 1 <= len(urlparse(href).path.strip("/").split("/")) <= 2 and ("tv" in label.lower() or "channel" in label.lower() or "serial" in label.lower()):
+        if not href or not same_site(href):
+            continue
+        path = urlparse(href).path.lower()
+        text = (label + " " + path).lower()
+        if any(keyword in text for keyword in ("serial", "tv", "show", "channel", "episode", "latest", "category", "all-serial", "series")) or "/category/" in path or "/tag/" in path:
             urls.append(href)
-    urls = list(dict.fromkeys(urls))[:12]
+    urls = list(dict.fromkeys(urls))[:20]
+
     async def fetch(item: str):
         try:
             return await get_text(client, item)
         except Exception:
             return None
+
     pages = await asyncio.gather(*(fetch(item) for item in urls))
     return [page for page in pages if page]
 
@@ -454,13 +489,19 @@ async def catalog(catalog_id: str, request: Request, query: str | None = None):
     for source, final in await collect_pages(request.app.state.http, TARGET_SITE, query):
         items.extend(links(source, final, catalog_id == "desiserials_latest"))
     items = dedupe(items)
-    if catalog_id == "desiserials_shows" and not items:
+    if catalog_id == "desiserials_shows" and len(items) < 15:
         for source, final in await collect_pages(request.app.state.http, TARGET_SITE, query):
             items.extend(links(source, final, True))
     metas = []
     for item in dedupe(items)[:MAX_CATALOG_ITEMS]:
         episode = catalog_id == "desiserials_latest" or is_episode_url(item["url"], item["title"])
-        metas.append({"id": page_id(item["url"], "dr_ep_" if episode else "dr_show_"), "type": "tv", "name": item["title"], "poster": item["poster"], "description": item["title"]})
+        metas.append({
+            "id": page_id(item["url"], "dr_ep_" if episode else "dr_show_"),
+            "type": "tv",
+            "name": item["title"],
+            "poster": item["poster"],
+            "description": item["title"],
+        })
     result = {"metas": metas}
     cache_set(key, result, 300)
     return result
@@ -476,7 +517,8 @@ async def meta(id: str, request: Request):
             source, final = await get_text(request.app.state.http, page)
             soup = BeautifulSoup(source, "html.parser")
             items = links(source, final, True)
-            name, poster = title_from_page(soup, "Indian Serial"), poster_for(soup.select_one("a[href]") or soup, final)
+            name = title_from_page(soup, "Indian Serial")
+            poster = poster_for(soup.select_one("img") or soup, final)
         except Exception:
             name, items, poster = "Indian Serial", [], DEFAULT_POSTER
         videos = []
@@ -522,9 +564,11 @@ async def stream(id: str, request: Request):
         candidates.extend(x for x in gateway_links(source, final) if x not in candidates)
         candidates.extend(x for x in extract_media(source, final) if x not in candidates)
         sem = asyncio.Semaphore(STREAM_CONCURRENCY)
+
         async def inspect(candidate: str):
             async with sem:
                 return await streams_from_url(client, candidate, page, request)
+
         batches = await asyncio.gather(*(inspect(x) for x in candidates[:STREAM_CANDIDATES_LIMIT]), return_exceptions=True)
         for batch in batches:
             if isinstance(batch, list):
@@ -541,3 +585,9 @@ async def stream(id: str, request: Request):
 async def unhandled(_: Request, exc: Exception):
     logger.exception("Unhandled addon error", exc_info=exc)
     return JSONResponse({"error": "Internal addon error"}, status_code=500)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
