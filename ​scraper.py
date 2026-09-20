@@ -19,34 +19,30 @@ HEADERS = {
 }
 
 POPULAR_CHANNELS = [
-    {"name": "Star Plus", "url": "https://www.desiserials.ru/category/star-plus/", "poster": "https://upload.wikimedia.org/wikipedia/commons/4/43/Star_Plus_logo.png"},
-    {"name": "Colors TV", "url": "https://www.desiserials.ru/category/colors-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/e/ea/Colors_TV_logo.png"},
-    {"name": "Zee TV", "url": "https://www.desiserials.ru/category/zee-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/e/eb/Zee_TV_logo.png"},
-    {"name": "Sony TV", "url": "https://www.desiserials.ru/category/sony-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/5/52/Sony_Entertainment_Television_logo.png"},
-    {"name": "SAB TV", "url": "https://www.desiserials.ru/category/sab-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/e/e0/Sony_SAB_logo.png"},
-    {"name": "&TV", "url": "https://www.desiserials.ru/category/and-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/1/1b/And_TV_logo.png"}
+    {"name": "Star Plus", "url": f"{TARGET_SITE}/category/star-plus/", "poster": "https://upload.wikimedia.org/wikipedia/commons/4/43/Star_Plus_logo.png"},
+    {"name": "Colors TV", "url": f"{TARGET_SITE}/category/colors-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/e/ea/Colors_TV_logo.png"},
+    {"name": "Zee TV", "url": f"{TARGET_SITE}/category/zee-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/e/eb/Zee_TV_logo.png"},
+    {"name": "Sony TV", "url": f"{TARGET_SITE}/category/sony-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/5/52/Sony_Entertainment_Television_logo.png"},
+    {"name": "SAB TV", "url": f"{TARGET_SITE}/category/sab-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/e/e0/Sony_SAB_logo.png"},
+    {"name": "&TV", "url": f"{TARGET_SITE}/category/and-tv/", "poster": "https://upload.wikimedia.org/wikipedia/commons/1/1b/And_TV_logo.png"}
 ]
 
 MANIFEST = {
-    "id": "org.desiserials.github.addon",
-    "version": "6.0.0",
-    "name": "Desi Serials HD (Serverless)",
-    "description": "Watch daily Hindi TV Serial episodes split into Parts & Servers directly on Stremio / Novio.",
+    "id": "org.desiserials.goat.addon",
+    "version": "7.0.0",
+    "name": "Desi Serials HD (GOAT Edition)",
+    "description": "Watch daily Hindi TV Serial episodes split into Parts & multi-server HD links directly on Stremio / Novio.",
     "resources": ["catalog", "meta", "stream"],
     "types": ["tv"],
     "catalogs": [
         {"type": "tv", "id": "desiserials_latest", "name": "Latest Daily Episodes"},
-        {"type": "tv", "id": "desiserials_channels", "name": "TV Channels"}
+        {"type": "tv", "id": "desiserials_channels", "name": "TV Channels / Networks"}
     ],
     "idPrefixes": ["ds_"]
 }
 
 def encode_id(url: str) -> str:
     return base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
-
-def decode_id(encoded_str: str) -> str:
-    padding = "=" * (-len(encoded_str) % 4)
-    return base64.urlsafe_b64decode(encoded_str + padding).decode()
 
 def save_json(filepath: str, data: dict):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -65,7 +61,7 @@ def extract_media_urls(html: str, base_url: str) -> list:
         src = tag.get("src") or tag.get("data-src")
         if src:
             full = urljoin(base_url, unquote(src))
-            if any(ext in full.lower() for ext in [".m3u8", ".mp4", "showdetails.org", "vk.com"]):
+            if any(ext in full.lower() for ext in [".m3u8", ".mp4", "showdetails.org", "vk.com", "streamwish"]):
                 found.add(full)
     return list(found)
 
@@ -111,21 +107,19 @@ def process_episode_streams(ep_url: str, ep_id: str):
             return
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # Find all player server links on page (JW Player, Video.js, Plyr, Shaka, HLS Player)
         server_links = []
         for a in soup.find_all("a", href=True):
             txt = a.text.strip()
             href = urljoin(ep_url, a["href"])
-            if any(p in txt.lower() or p in href.lower() for p in ["jw player", "video.js", "plyr", "shaka", "hls player", "showdetails"]):
+            if any(p in txt.lower() or p in href.lower() for p in ["jw player", "video.js", "plyr", "shaka", "hls player", "showdetails", "watch now"]):
                 s_name = "Server"
-                if "jw" in txt.lower(): s_name = "JW Player"
-                elif "video.js" in txt.lower(): s_name = "Video.js"
-                elif "plyr" in txt.lower(): s_name = "Plyr"
-                elif "shaka" in txt.lower(): s_name = "Shaka"
-                elif "hls" in txt.lower(): s_name = "HLS Player"
+                if "jw" in txt.lower(): s_name = "JW Player HD"
+                elif "video.js" in txt.lower(): s_name = "Video.js HD"
+                elif "plyr" in txt.lower(): s_name = "Plyr HD"
+                elif "shaka" in txt.lower(): s_name = "Shaka Player"
+                elif "hls" in txt.lower(): s_name = "HLS Stream"
                 server_links.append((href, s_name))
 
-        # Build part-wise streams (Part 1, Part 2, Part 3)
         for part_num in (1, 2, 3):
             part_ep_id = f"{ep_id}_p{part_num}"
             streams = []
@@ -159,7 +153,6 @@ def process_episode_streams(ep_url: str, ep_id: str):
                 except Exception as ex:
                     logging.warning(f"Error scraping server {srv_url}: {ex}")
 
-            # Save stream endpoint static JSON
             save_json(
                 os.path.join(PUBLIC_DIR, "stream", "tv", f"{part_ep_id}.json"),
                 {"streams": streams}
@@ -171,10 +164,8 @@ def process_episode_streams(ep_url: str, ep_id: str):
 def build_addon():
     logging.info("Starting Stremio Static Addon Generation...")
     
-    # 1. Manifest JSON
     save_json(os.path.join(PUBLIC_DIR, "manifest.json"), MANIFEST)
 
-    # 2. Channels Catalog
     channel_metas = []
     for ch in POPULAR_CHANNELS:
         ch_id = f"ds_cat_{encode_id(ch['url'])}"
@@ -190,7 +181,6 @@ def build_addon():
         {"metas": channel_metas}
     )
 
-    # 3. Latest Episodes Catalog
     latest_episodes = parse_episodes_from_page(TARGET_SITE)
     latest_metas = []
     for ep in latest_episodes[:40]:
@@ -206,7 +196,6 @@ def build_addon():
         {"metas": latest_metas}
     )
 
-    # 4. Generate Channel Meta & Episode Lists
     for ch in POPULAR_CHANNELS:
         ch_id = f"ds_cat_{encode_id(ch['url'])}"
         episodes = parse_episodes_from_page(ch["url"])
@@ -214,7 +203,6 @@ def build_addon():
         
         ep_idx = 1
         for ep in episodes[:15]:
-            # Generate Metadata and Streams for Episode Parts
             process_episode_streams(ep["url"], ep["id"])
 
             for p_num in (1, 2, 3):
@@ -240,7 +228,6 @@ def build_addon():
             }
         )
 
-    # 5. Build Individual Episode Meta Files
     for ep in latest_episodes[:20]:
         process_episode_streams(ep["url"], ep["id"])
         for p_num in (1, 2, 3):
