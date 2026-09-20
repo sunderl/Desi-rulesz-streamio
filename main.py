@@ -1,14 +1,15 @@
 import base64
 import re
 from urllib.parse import urljoin
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import httpx
 from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-# 1. FIXED CORS (Browser and Stremio compliant)
+# 1. FIXED CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,10 +28,10 @@ POPULAR_SERIALS = [
 ]
 
 MANIFEST = {
-    "id": "org.desiruleztv.fixed.addon",
-    "version": "3.0.0",
-    "name": "DesiRulez TV (Full Fixed)",
-    "description": "Watch All Indian Serials with Direct In-App Playback & Base64 URL Safety",
+    "id": "org.desiruleztv.proxy.addon",
+    "version": "3.1.0",
+    "name": "DesiRulez TV (No-VPN Stream)",
+    "description": "Watch All Indian Serials Online without VPN using Proxy Stream Bypass",
     "resources": ["catalog", "meta", "stream"],
     "types": ["tv"],
     "catalogs": [
@@ -80,6 +81,27 @@ def parse_date_from_title(title: str) -> str:
         return f"{year}-{month}-{int(day):02d}"
     return None
 
+# 🚀 PROXY ROUTE: BINa VPN KE STREAM CHALANE KE LIYE
+@app.get("/proxy")
+async def proxy_stream(url: str):
+    try:
+        target_url = decode_url(url)
+        client = httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30.0)
+        req = client.build_request("GET", target_url)
+        res = await client.send(req, stream=True)
+
+        return StreamingResponse(
+            res.aiter_raw(),
+            status_code=res.status_code,
+            headers={
+                "Content-Type": res.headers.get("content-type", "video/mp4"),
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
+    except Exception as e:
+        return {"error": f"Proxy bypass failed: {str(e)}"}
+
 @app.get("/")
 def home():
     return {"status": "DesiRulez Addon Active!", "manifest": "/manifest.json"}
@@ -88,7 +110,7 @@ def home():
 def manifest():
     return MANIFEST
 
-# 2. CATALOGS & SEARCH
+# CATALOGS & SEARCH
 @app.get("/catalog/tv/{catalog_id}.json")
 @app.get("/catalog/tv/{catalog_id}/search={query}.json")
 async def catalog(catalog_id: str, query: str = None):
@@ -121,12 +143,10 @@ async def catalog(catalog_id: str, query: str = None):
                 if full_url in seen_urls:
                     continue
                 
-                # Strict episode link check
                 if any(kw in full_url.lower() for kw in ["/episode", "/watch-online", "-episode-"]) and len(title) > 8:
                     seen_urls.add(full_url)
                     ep_id = f"dr_ep_{encode_url(full_url)}"
                     
-                    # Extract poster image
                     img_tag = a.find("img") or (a.parent.find("img") if a.parent else None)
                     poster = DEFAULT_POSTER
                     if img_tag:
@@ -146,7 +166,7 @@ async def catalog(catalog_id: str, query: str = None):
 
     return {"metas": metas[:40]}
 
-# 3. METADATA (EPISODES & CATEGORIES)
+# METADATA
 @app.get("/meta/tv/{id}.json")
 async def meta(id: str):
     if id.startswith("dr_cat_"):
@@ -240,21 +260,21 @@ async def meta(id: str):
         if released_date:
             video_item["released"] = released_date
 
-        meta_data = {
-            "id": id,
-            "type": "tv",
-            "name": title,
-            "poster": DEFAULT_POSTER,
-            "description": f"Watch {title} in HD Direct Stream",
-            "videos": [video_item]
+        return {
+            "meta": {
+                "id": id,
+                "type": "tv",
+                "name": title,
+                "poster": DEFAULT_POSTER,
+                "description": f"Watch {title} in HD Direct Stream",
+                "videos": [video_item]
+            }
         }
-        return {"meta": meta_data}
 
     return {"meta": {"id": id, "type": "tv", "name": "Unknown"}}
 
-# 4. DEEP STREAM EXTRACTION (DIRECT .M3U8 / .MP4 / VK)
-async def extract_direct_media(embed_url: str, client: httpx.AsyncClient) -> list:
-    """Scrape embed URL scripts for direct .m3u8, .mp4, or VK video sources"""
+# DEEP STREAM EXTRACTION WITH PROXY CONVERSION
+async def extract_direct_media(embed_url: str, client: httpx.AsyncClient, base_url: str) -> list:
     found_streams = []
     try:
         res = await client.get(embed_url, timeout=8.0)
@@ -264,10 +284,17 @@ async def extract_direct_media(embed_url: str, client: httpx.AsyncClient) -> lis
         m3u8_links = re.findall(r'["\'](https?://[^"\']+\.m3u8[^"\']*)["\']', html)
         for link in m3u8_links:
             clean_link = link.replace("\\/", "/")
-            if clean_link not in [s["url"] for s in found_streams]:
+            proxy_link = f"{base_url}proxy?url={encode_url(clean_link)}"
+            if proxy_link not in [s["url"] for s in found_streams]:
                 found_streams.append({
-                    "name": "Direct HLS [HD]",
-                    "title": "In-App Direct Stream (.m3u8)",
+                    "name": "⚡ No-VPN Proxy [Fast]",
+                    "title": "Bypass ISP Block (No VPN Required)",
+                    "url": proxy_link
+                })
+                # Direct option backup
+                found_streams.append({
+                    "name": "Direct Stream [HLS]",
+                    "title": "Direct Stream (.m3u8)",
                     "url": clean_link
                 })
 
@@ -275,22 +302,24 @@ async def extract_direct_media(embed_url: str, client: httpx.AsyncClient) -> lis
         mp4_links = re.findall(r'["\'](https?://[^"\']+\.mp4[^"\']*)["\']', html)
         for link in mp4_links:
             clean_link = link.replace("\\/", "/")
-            if clean_link not in [s["url"] for s in found_streams]:
+            proxy_link = f"{base_url}proxy?url={encode_url(clean_link)}"
+            if proxy_link not in [s["url"] for s in found_streams]:
                 found_streams.append({
-                    "name": "Direct MP4 [HD]",
-                    "title": "In-App Direct MP4 Play",
-                    "url": clean_link
+                    "name": "⚡ No-VPN Proxy [MP4]",
+                    "title": "Bypass ISP Block (Direct MP4)",
+                    "url": proxy_link
                 })
 
-        # 3. VK Stream quality parameters inside embed JS
+        # 3. VK Stream quality parameters
         vk_urls = re.findall(r'"url(?:720|1080|480|360)"\s*:\s*"([^"]+)"', html)
         for v_url in vk_urls:
             clean_link = v_url.replace("\\/", "/")
-            if clean_link not in [s["url"] for s in found_streams]:
+            proxy_link = f"{base_url}proxy?url={encode_url(clean_link)}"
+            if proxy_link not in [s["url"] for s in found_streams]:
                 found_streams.append({
-                    "name": "VK Server [HD 720p]",
-                    "title": "In-App Fast VK Stream",
-                    "url": clean_link
+                    "name": "⚡ No-VPN Proxy [VK Server]",
+                    "title": "Bypass ISP Block (VK Stream 720p)",
+                    "url": proxy_link
                 })
 
     except Exception as e:
@@ -299,7 +328,7 @@ async def extract_direct_media(embed_url: str, client: httpx.AsyncClient) -> lis
     return found_streams
 
 @app.get("/stream/tv/{id}.json")
-async def stream(id: str):
+async def stream(id: str, request: Request):
     streams = []
     
     if not id.startswith("dr_ep_"):
@@ -312,30 +341,32 @@ async def stream(id: str):
         print(f"URL Decode error: {e}")
         return {"streams": []}
 
+    base_server_url = str(request.base_url)
+
     try:
         async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=12.0) as client:
             res = await client.get(page_url)
             soup = BeautifulSoup(res.text, "html.parser")
 
-            # 1. Look for iframes
+            # 1. Search IFrames
             iframes = soup.find_all("iframe", src=True)
             for iframe in iframes:
                 src = urljoin(page_url, iframe["src"].strip())
 
                 if any(srv in src for srv in ["vk.com", "vkprime", "streamwish", "filelions", "dood", "vidoza", "streamtape"]):
-                    direct_streams = await extract_direct_media(src, client)
+                    direct_streams = await extract_direct_media(src, client, base_server_url)
                     streams.extend(direct_streams)
 
-                    # Backup iframe stream if deep extract didn't get raw video URL
-                    if not direct_streams:
-                        streams.append({
-                            "name": "Embed Server",
-                            "title": f"Player Stream ({src.split('/')[2]})",
-                            "url": src
-                        })
+                    # Embed Proxy Option
+                    proxy_embed = f"{base_server_url}proxy?url={encode_url(src)}"
+                    streams.append({
+                        "name": "⚡ No-VPN Embed Stream",
+                        "title": f"Bypass ISP ({src.split('/')[2]})",
+                        "url": proxy_embed
+                    })
 
-            # 2. Look for inline scripts on the page
-            page_direct_streams = await extract_direct_media(page_url, client)
+            # 2. Search Page Scripts
+            page_direct_streams = await extract_direct_media(page_url, client, base_server_url)
             for ds in page_direct_streams:
                 if ds["url"] not in [s["url"] for s in streams]:
                     streams.append(ds)
@@ -347,7 +378,7 @@ async def stream(id: str):
     unique_streams = []
     seen_stream_urls = set()
     for s in streams:
-        u = s.get("url") or s.get("externalUrl")
+        u = s.get("url")
         if u and u not in seen_stream_urls:
             seen_stream_urls.add(u)
             unique_streams.append(s)
